@@ -176,7 +176,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
 {
     setWindowTitle(QStringLiteral("План задач"));
     resize(1120, 740);
-    setMinimumSize(720, 480);
+    setMinimumSize(840, 480);
     systemDark = QApplication::palette().color(QPalette::Window).lightness() < 128;
 
     auto *root = new QWidget(this);
@@ -188,7 +188,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
 
     auto *sidebar = new QWidget(root);
     sidebar->setObjectName("sidebar");
-    sidebar->setFixedWidth(266);
+    sidebar->setFixedWidth(300);
     auto *left = new QVBoxLayout(sidebar);
     left->setContentsMargins(13, 9, 13, 14);
     left->setSpacing(12);
