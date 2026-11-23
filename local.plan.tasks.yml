@@ -13,6 +13,7 @@ modules:
     buildsystem: cmake-ninja
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
+    run-tests: true
     test-rule: test
     sources:
       - type: dir

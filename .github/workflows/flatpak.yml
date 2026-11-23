@@ -1,0 +1,69 @@
+name: Flatpak
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build and test the Flatpak
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder dbus
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          channel=dev
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            channel=stable
+          fi
+          build_root="$RUNNER_TEMP/plan-tasks"
+          mkdir -p "$build_root" "$RUNNER_TEMP/plan-bundle"
+          flatpak-builder --user --install-deps-from=flathub --disable-rofiles-fuse \
+            --state-dir="$build_root/state" --repo="$build_root/repo" --default-branch="$channel" \
+            "$build_root/app" local.plan.tasks.yml
+          bundle="$RUNNER_TEMP/plan-bundle/plan-tasks-x86_64.flatpak"
+          flatpak build-bundle --arch=x86_64 --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            "$build_root/repo" "$bundle" local.plan.tasks "$channel"
+          dbus-run-session -- flatpak install --user --no-related --no-deps -y "$bundle"
+          dbus-run-session -- flatpak run --user --env=QT_QPA_PLATFORM=offscreen \
+            "local.plan.tasks//$channel" --smoke-test
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flatpak-x86_64
+          path: ${{ runner.temp }}/plan-bundle/plan-tasks-x86_64.flatpak
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: flatpak-x86_64
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/release.sh
