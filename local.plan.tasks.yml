@@ -1,0 +1,24 @@
+app-id: local.plan.tasks
+runtime: org.kde.Platform
+runtime-version: '6.11'
+sdk: org.kde.Sdk
+command: plan-tasks
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+modules:
+  - name: plan-tasks
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+    run-tests: true
+    test-rule: test
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - .git
+          - .flatpak-builder
+          - build
