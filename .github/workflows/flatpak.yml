@@ -25,7 +25,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder dbus
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder dbus elfutils
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           channel=dev
           if [[ "$GITHUB_REF" == refs/heads/main ]]; then
