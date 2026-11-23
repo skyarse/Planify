@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=План задач
+Name[en]=Task Plan
+Exec=plan-tasks
+Icon=local.plan.tasks
+Terminal=false
+Type=Application
+Categories=Office;ProjectManagement;
+StartupNotify=true
