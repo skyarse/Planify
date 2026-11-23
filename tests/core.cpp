@@ -32,14 +32,15 @@ QByteArray response(const QByteArray &href, const QByteArray &properties)
 }
 
 QByteArray taskResponse(const QByteArray &name, const QByteArray &uid, const QByteArray &title,
-                        const QByteArray &extra = {})
+                        const QByteArray &extra = {}, const QByteArray &instances = {}, bool withEtag = true)
 {
+    const QByteArray etag = withEtag ? "<d:getetag>\x22v1\x22</d:getetag>" : "";
     return response("/dav.php/calendars/demo/tasks/" + name + ".ics",
-        "<d:getetag>\x22v1\x22</d:getetag><c:calendar-data><![CDATA["
+        etag + "<c:calendar-data><![CDATA["
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//CalDAV//EN\r\nBEGIN:VTODO\r\nUID:" +
         uid + "\r\nDTSTAMP:20261101T120000Z\r\nSUMMARY:" + title +
         "\r\nDUE;VALUE=DATE:20261203\r\n" + extra +
-        "END:VTODO\r\nEND:VCALENDAR\r\n]]></c:calendar-data>");
+        "END:VTODO\r\n" + instances + "END:VCALENDAR\r\n]]></c:calendar-data>");
 }
 
 struct MockServer {
@@ -50,6 +51,13 @@ struct MockServer {
     bool deleted = false;
     bool changed = false;
     bool authenticated = false;
+    bool incompatible = false;
+    bool withoutEtag = false;
+    bool recurring = false;
+    bool malformedParent = false;
+    bool duplicateParent = false;
+    qsizetype skipped = 0;
+    qsizetype recovered = 0;
 
     MockServer()
     {
@@ -108,10 +116,26 @@ struct MockServer {
                 "<c:supported-calendar-component-set><c:comp name='VEVENT'/></c:supported-calendar-component-set>"));
         } else if (method == "REPORT" && path == "/dav.php/calendars/demo/tasks/") {
             validQuery = received.mid(split + 4).contains("name='VTODO'");
-            auto tasks = taskResponse("first", "uid-a", changed ? "Updated" : "Parent",
-                "CATEGORIES:work\r\nX-PINNED:TRUE\r\nX-CUSTOM:must-survive\r\n");
+            QByteArray tasks;
+            if (malformedParent) {
+                tasks = response(path + "first.ics", "<c:calendar-data>not a task</c:calendar-data>");
+            } else {
+                QByteArray fields = "CATEGORIES:work\r\nX-PINNED:TRUE\r\nX-CUSTOM:must-survive\r\n";
+                QByteArray instances;
+                if (incompatible)
+                    fields += "DTSTART:not-a-date\r\n";
+                if (recurring) {
+                    fields += "DTSTART;VALUE=DATE:20261202\r\nRRULE:FREQ=WEEKLY\r\n";
+                    instances = "BEGIN:VTODO\r\nUID:uid-a\r\nDTSTAMP:20261101T120000Z\r\n"
+                                "RECURRENCE-ID;VALUE=DATE:20261209\r\nSUMMARY:Moved occurrence\r\n"
+                                "DTSTART;VALUE=DATE:20261210\r\nEND:VTODO\r\n";
+                }
+                tasks = taskResponse("first", "uid-a", changed ? "Updated" : "Parent", fields, instances, !withoutEtag);
+            }
+            if (duplicateParent)
+                tasks += taskResponse("duplicate", "uid-a", "Ambiguous replacement");
             if (!deleted)
-                tasks += taskResponse("second", "uid-b", "Подзадача",
+                tasks += taskResponse("second", "uid-b", malformedParent ? "Updated child" : "Подзадача",
                     "RELATED-TO;RELTYPE=PARENT:uid-a\r\nDESCRIPTION:Строка\\nСледующая\r\n");
             body = reportBroken ? multistatus(tasks).chopped(8) : multistatus(tasks);
         } else {
@@ -131,6 +155,8 @@ struct MockServer {
         QString error;
         QObject::connect(&client, &CalDav::imported, &loop, [&](const QList<RemoteList> &data) {
             store.importReadOnly(data);
+            skipped = data.first().skipped;
+            recovered = data.first().recovered;
             ready = true;
             loop.quit();
         });
@@ -286,7 +312,41 @@ void remoteTasks(const QString &path)
         store.task(parent.id).title == "Parent", "partial response replaced local snapshot");
 
     mock.reportBroken = false;
+    mock.incompatible = true;
+    expect(mock.import(store) && mock.recovered == 1 && mock.skipped == 0, "partial iCalendar fields blocked import");
+    auto updatedParent = store.task(parent.id);
+    expect(updatedParent.title == "Updated" && updatedParent.calendarData.contains("DTSTART:not-a-date") &&
+           updatedParent.due == QDate(2026,12,3), "recoverable task lost data");
+
+    mock.incompatible = false;
+    mock.withoutEtag = true;
+    expect(mock.import(store) && mock.recovered == 1 && store.task(parent.id).etag.isEmpty(),
+        "missing ETag blocked read-only import");
+
+    mock.withoutEtag = false;
+    mock.recurring = true;
+    expect(mock.import(store) && mock.skipped == 0 && mock.recovered == 0, "recurring task with an exception failed");
+    updatedParent = store.task(parent.id);
+    expect(updatedParent.title == "Updated" && updatedParent.repeat == "remote" &&
+           updatedParent.due == QDate(2026,12,2) && updatedParent.calendarData.contains("RECURRENCE-ID"),
+           "recurrence master or raw exception lost");
+
+    mock.recurring = false;
+    mock.changed = false;
+    mock.malformedParent = true;
+    expect(mock.import(store) && mock.skipped == 1 && mock.recovered == 0 &&
+           store.task(parent.id).title == "Updated" && store.task(child.id).parent == parent.id &&
+           store.task(child.id).title == "Updated child",
+           "malformed object hid the collection or erased existing tasks");
+
+    mock.malformedParent = false;
+    mock.duplicateParent = true;
     mock.deleted = true;
+    expect(mock.import(store) && mock.skipped == 2 && ids(store.query(page)) == tasks &&
+           store.task(parent.id).title == "Updated", "ambiguous snapshot changed the local copy");
+
+    mock.duplicateParent = false;
+    mock.changed = true;
     expect(mock.import(store), "updated mock import failed");
     expect(ids(store.query(page)) == QStringList{parent.id} &&
         store.task(parent.id).title == "Updated", "server changes not mirrored");

@@ -41,6 +41,8 @@ struct Task {
 struct RemoteList {
     Project project;
     QList<Task> tasks;
+    qsizetype skipped = 0;
+    qsizetype recovered = 0;
 };
 
 enum class Page { Inbox, Today, Scheduled, Pins, Labels, Completed, Project };

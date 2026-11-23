@@ -347,12 +347,28 @@ void Store::importReadOnly(const QList<RemoteList> &lists)
             run(q);
 
             QSet<QString> seen;
-            for (const auto &t : list.tasks) {
+            for (auto t : list.tasks) {
                 if (t.id.isEmpty() || t.project != list.project.id || !t.remote() || seen.contains(t.id))
                     throw std::runtime_error("Сервер вернул неоднозначный список задач");
+                if (list.skipped && t.parent.isEmpty() && !t.remoteParentUid.isEmpty()
+                    && t.remoteParentUid != t.remoteUid) {
+                    q.prepare("SELECT id FROM tasks WHERE project=? AND remote_uid=? AND href<>'' LIMIT 2");
+                    q.addBindValue(t.project);
+                    q.addBindValue(t.remoteParentUid);
+                    run(q);
+                    if (q.next()) {
+                        const auto parentId = q.value(0).toString();
+                        if (!q.next())
+                            t.parent = parentId;
+                    }
+                    q.finish();
+                }
                 writeTask(t);
                 seen.insert(t.id);
             }
+            if (list.skipped)
+                continue;
+
             q.prepare("SELECT id FROM tasks WHERE project=? AND href<>''");
             q.addBindValue(list.project.id);
             run(q);

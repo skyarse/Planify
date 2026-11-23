@@ -750,10 +750,20 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
                 else
                     editTask(update);
             }
-            int count = 0;
-            for (const auto &entry : lists)
+            qsizetype count = 0;
+            qsizetype recovered = 0;
+            qsizetype skipped = 0;
+            for (const auto &entry : lists) {
                 count += entry.tasks.size();
-            message(QStringLiteral("Baïkal · задач загружено: %1").arg(count));
+                recovered += entry.recovered;
+                skipped += entry.skipped;
+            }
+            auto summary = QStringLiteral("Baïkal · загружено задач: %1").arg(count);
+            if (recovered)
+                summary += QStringLiteral(" · с неполными полями: %1").arg(recovered);
+            if (skipped)
+                summary += QStringLiteral(" · пропущено: %1. Предыдущие записи сохранены.").arg(skipped);
+            message(summary);
         } catch (const std::exception &error) {
             message(QString::fromUtf8(error.what()));
         }

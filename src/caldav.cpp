@@ -140,7 +140,7 @@ QList<Properties> readResponse(const QByteArray &data, bool strict)
                 xml.skipCurrentElement();
             }
         }
-        if (href.isEmpty() || (strict && successful.isEmpty()))
+        if (href.isEmpty())
             fail(QStringLiteral("CalDAV вернул неполный список задач"));
         Properties entry;
         entry.href = href;
@@ -168,28 +168,53 @@ QString dataId(const QByteArray &value)
     return QString::fromLatin1(QCryptographicHash::hash(value, QCryptographicHash::Sha256).toHex());
 }
 
-Task readTask(const Project &project, const QString &href, const Properties &entry)
+std::optional<Task> readTask(const Project &project, const QString &href, const Properties &entry, bool &recovered)
 {
-    if (entry.ical.contains('\0') || entry.etag.isEmpty())
-        fail(QStringLiteral("Сервер не вернул задачу или её ETag"));
+    if (entry.ical.isEmpty() || entry.ical.contains('\0'))
+        return {};
     using Component = std::unique_ptr<icalcomponent, decltype(&icalcomponent_free)>;
     Component calendar(icalparser_parse_string(entry.ical.constData()), &icalcomponent_free);
-    if (!calendar || icalcomponent_isa(calendar.get()) != ICAL_VCALENDAR_COMPONENT ||
-        icalcomponent_count_errors(calendar.get()) > 0)
-        fail(QStringLiteral("CalDAV вернул задачу в неподдерживаемом формате"));
-    auto *todo = icalcomponent_get_first_component(calendar.get(), ICAL_VTODO_COMPONENT);
-    if (!todo || icalcomponent_get_next_component(calendar.get(), ICAL_VTODO_COMPONENT))
-        fail(QStringLiteral("Сложный повтор на сервере. Последняя локальная копия сохранена"));
+    if (!calendar || icalcomponent_isa(calendar.get()) != ICAL_VCALENDAR_COMPONENT)
+        return {};
+
+    icalcomponent *master = nullptr;
+    icalcomponent *first = nullptr;
+    QString uid;
+    int instances = 0;
+    for (auto *part = icalcomponent_get_first_component(calendar.get(), ICAL_VTODO_COMPONENT); part;
+         part = icalcomponent_get_next_component(calendar.get(), ICAL_VTODO_COMPONENT)) {
+        const auto partUid = QString::fromUtf8(icalcomponent_get_uid(part));
+        if (partUid.trimmed().isEmpty() || (first && partUid != uid))
+            return {};
+        if (!first) {
+            first = part;
+            uid = partUid;
+        }
+        if (!icalcomponent_get_first_property(part, ICAL_RECURRENCEID_PROPERTY)) {
+            if (master)
+                return {};
+            master = part;
+        }
+        ++instances;
+    }
+    if (!master && instances != 1)
+        return {};
+    auto *todo = master ? master : first;
+
     Task t;
-    t.remoteUid = QString::fromUtf8(icalcomponent_get_uid(todo));
-    if (t.remoteUid.isEmpty())
-        fail(QStringLiteral("CalDAV вернул задачу без UID"));
+    t.remoteUid = uid;
+    const bool hasParseErrors = icalcomponent_count_errors(calendar.get()) > 0;
+    t.title = QString::fromUtf8(icalcomponent_get_summary(todo));
+    if (t.title.isEmpty() && hasParseErrors)
+        return {};
+    recovered = hasParseErrors || entry.etag.isEmpty();
+    if (instances > 1)
+        t.repeat = QStringLiteral("remote");
     t.id = dataId(project.id.toUtf8() + '\0' + t.remoteUid.toUtf8());
     t.project = project.id;
     t.href = href;
     t.etag = entry.etag;
     t.calendarData = entry.ical;
-    t.title = QString::fromUtf8(icalcomponent_get_summary(todo));
     if (t.title.isEmpty())
         t.title = QStringLiteral("Без названия");
     t.notes = QString::fromUtf8(icalcomponent_get_description(todo));
@@ -372,21 +397,40 @@ void CalDav::parse(Step step, const QUrl &url, const QByteArray &data)
     }
     auto &list = lists[collection];
     QHash<QString, QString> ids;
+    QSet<QString> duplicateUids;
+    QSet<QString> recoveredUids;
     QSet<QUrl> resources;
+    QString basePath = url.path(QUrl::FullyEncoded);
+    if (!basePath.endsWith('/'))
+        basePath += '/';
     for (const auto &entry : entries) {
         const auto href = resolve(url, entry.href);
-        QString basePath = url.path(QUrl::FullyEncoded);
-        if (!basePath.endsWith('/'))
-            basePath += '/';
         if (!href.path(QUrl::FullyEncoded).startsWith(basePath) || href == url || resources.contains(href))
             fail(QStringLiteral("CalDAV вернул неоднозначный список задач"));
         resources.insert(href);
-        auto task = readTask(list.project, href.toString(), entry);
-        if (ids.contains(task.remoteUid))
-            fail(QStringLiteral("В одном списке Baïkal повторяется UID задачи"));
-        ids.insert(task.remoteUid, task.id);
-        list.tasks.append(std::move(task));
+        bool recovered = false;
+        auto task = readTask(list.project, href.toString(), entry, recovered);
+        if (!task) {
+            ++list.skipped;
+            continue;
+        }
+        if (duplicateUids.contains(task->remoteUid)) {
+            ++list.skipped;
+            continue;
+        }
+        if (ids.remove(task->remoteUid)) {
+            duplicateUids.insert(task->remoteUid);
+            recoveredUids.remove(task->remoteUid);
+            list.skipped += 2;
+            continue;
+        }
+        ids.insert(task->remoteUid, task->id);
+        if (recovered)
+            recoveredUids.insert(task->remoteUid);
+        list.tasks.append(std::move(*task));
     }
+    list.recovered = recoveredUids.size();
+    list.tasks.removeIf([&](const Task &task) { return duplicateUids.contains(task.remoteUid); });
     for (auto &t : list.tasks)
         if (t.remoteParentUid != t.remoteUid)
             t.parent = ids.value(t.remoteParentUid);
