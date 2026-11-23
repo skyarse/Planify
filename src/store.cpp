@@ -1,6 +1,10 @@
 #include "store.h"
 
 #include <QSet>
+#include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QTemporaryDir>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QUrl>
@@ -52,10 +56,11 @@ Store::Store(const QString &path) : connection(newId()), db(QSqlDatabase::addDat
 {
     try {
         db.setDatabaseName(path);
-        db.setConnectOptions("QSQLITE_BUSY_TIMEOUT=4000");
+        db.setConnectOptions("QSQLITE_BUSY_TIMEOUT=4000;QSQLITE_OPEN_URI");
         const bool opened = db.open();
         failUnless(opened, db.lastError());
         execute("PRAGMA foreign_keys=ON");
+        execute("PRAGMA trusted_schema=OFF");
         execute("PRAGMA journal_mode=WAL");
         QSqlQuery version(db);
         failUnless(version.exec("PRAGMA user_version"), version.lastError());
@@ -383,7 +388,9 @@ QSqlQuery Store::query(const Filter &f) const
             terms += "t.project='inbox' AND t.done=0";
             break;
         case Page::Today:
-            terms += "t.done=0 AND ((t.due<>'' AND t.due<=?) OR (t.deadline<>'' AND t.deadline<=?))";
+            if (!f.showDone)
+                terms += "t.done=0";
+            terms += "((t.due<>'' AND t.due<=?) OR (t.deadline<>'' AND t.deadline<=?))";
             values << today << today;
             break;
         case Page::Scheduled:
@@ -416,13 +423,131 @@ QSqlQuery Store::query(const Filter &f) const
         terms += "t.section=?";
         values << *f.section;
     }
+    QString order = "coalesce(nullif(t.due,''),nullif(t.deadline,''),'9999-12-31')";
+    if (f.sort == 1) order = "t.title_norm";
+    if (f.sort == 2) order = "case when t.priority=0 then 4 else t.priority end";
     QSqlQuery q(db);
     q.prepare("SELECT t.id,t.title,t.done,t.priority,t.due,coalesce(s.title,p.title),t.parent,t.href,t.pinned,t.deadline,"
               " t.section,t.project FROM tasks AS t JOIN projects AS p ON p.id=t.project"
               " LEFT JOIN sections AS s ON s.id=t.section WHERE " + terms.join(" AND ") +
-              " ORDER BY t.pinned DESC, coalesce(nullif(t.due,''),nullif(t.deadline,''),'9999-12-31'), t.rowid");
+              " ORDER BY t.done ASC, t.pinned DESC, " + order + ", t.rowid");
     for (const auto &v : values)
         q.addBindValue(v);
     run(q);
     return q;
+}
+
+QHash<QString, int> Store::projectCounts() const
+{
+    QSqlQuery q(db);
+    const bool ok = q.exec("SELECT project,count(*) FROM tasks WHERE done=0 GROUP BY project");
+    failUnless(ok, q.lastError());
+    QHash<QString,int> counts;
+    while (q.next())
+        counts.insert(q.value(0).toString(), q.value(1).toInt());
+    return counts;
+}
+
+int Store::count(Page page, bool overdueOnly) const
+{
+    QString condition;
+    switch (page) {
+    case Page::Inbox: condition = "project='inbox' AND done=0"; break;
+    case Page::Today:
+        condition = overdueOnly
+            ? "done=0 AND ((due<>'' AND due<?) OR (deadline<>'' AND deadline<?))"
+            : "done=0 AND ((due<>'' AND due<=?) OR (deadline<>'' AND deadline<=?))";
+        break;
+    case Page::Pins: condition = "done=0 AND pinned=1"; break;
+    case Page::Completed: condition = "done=1"; break;
+    default: return 0;
+    }
+    QSqlQuery q(db);
+    q.prepare("SELECT count(*) FROM tasks WHERE " + condition);
+    if (page == Page::Today) {
+        q.addBindValue(iso(QDate::currentDate()));
+        q.addBindValue(iso(QDate::currentDate()));
+    }
+    run(q);
+    return q.next() ? q.value(0).toInt() : 0;
+}
+
+void Store::backup(const QString &path)
+{
+    if (QFileInfo(path).absoluteFilePath() == QFileInfo(db.databaseName()).absoluteFilePath()
+        || (!QFileInfo(path).canonicalFilePath().isEmpty()
+            && QFileInfo(path).canonicalFilePath() == QFileInfo(db.databaseName()).canonicalFilePath()))
+        throw std::runtime_error("Выберите отдельный файл для резервной копии");
+
+    QTemporaryDir temp;
+    if (!temp.isValid())
+        throw std::runtime_error("Не удалось создать временный каталог");
+    QFile snapshot(temp.filePath("backup.sqlite"));
+    QSqlQuery q(db);
+    q.prepare("VACUUM INTO ?");
+    q.addBindValue(snapshot.fileName());
+    run(q);
+    QSaveFile output(path);
+    if (!snapshot.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
+        throw std::runtime_error("Не удалось открыть файл резервной копии");
+    while (!snapshot.atEnd()) {
+        const auto part = snapshot.read(65536);
+        if (part.isEmpty() || output.write(part) != part.size())
+            throw std::runtime_error("Не удалось записать резервную копию");
+    }
+    if (!output.commit())
+        throw std::runtime_error("Не удалось сохранить резервную копию");
+}
+
+void Store::importBackup(const QString &path)
+{
+    const QFileInfo input(path);
+    if (!input.isFile() || input.canonicalFilePath() == QFileInfo(db.databaseName()).canonicalFilePath())
+        throw std::runtime_error("Выберите отдельный файл резервной копии");
+
+    QSqlQuery attach(db);
+    attach.prepare("ATTACH DATABASE ? AS snapshot");
+    auto url = QUrl::fromLocalFile(input.canonicalFilePath());
+    url.setQuery("mode=ro");
+    attach.addBindValue(QString::fromUtf8(url.toEncoded()));
+    run(attach);
+    attach.finish();
+
+    try {
+        {
+            QSqlQuery check(db);
+            bool ok = check.exec("PRAGMA snapshot.user_version");
+            failUnless(ok, check.lastError());
+            if (!check.next() || check.value(0).toInt()!=1)
+                throw std::runtime_error("Формат резервной копии не поддерживается");
+            ok = check.exec("PRAGMA snapshot.quick_check");
+            failUnless(ok, check.lastError());
+            if (!check.next() || check.value(0).toString() != "ok")
+                throw std::runtime_error("Файл резервной копии повреждён");
+            check.finish();
+        }
+        const QList<QPair<QString,QString>> tables{
+            {"projects","id,title,account,href"},
+            {"sections","id,project,title"},
+            {"tasks","id,project,section,parent,title,notes,tags,due,deadline,priority,done,pinned,repeat,href,etag,ical,remote_uid,remote_parent_uid,title_norm,notes_norm,tags_norm"},
+        };
+        failUnless(db.transaction(), db.lastError());
+        for (const auto &[name,columns] : tables) {
+            QSqlQuery type(db);
+            type.prepare("SELECT type FROM snapshot.sqlite_master WHERE name=?");
+            type.addBindValue(name);
+            run(type);
+            if (!type.next() || type.value(0).toString() != "table")
+                throw std::runtime_error("В резервной копии отсутствуют таблицы задач");
+            type.finish();
+            execute("INSERT INTO main." + name + "(" + columns + ") SELECT " + columns + " FROM snapshot." + name
+                + " WHERE 1 ON CONFLICT(id) DO NOTHING");
+        }
+        failUnless(db.commit(), db.lastError());
+    } catch (...) {
+        db.rollback();
+        execute("DETACH DATABASE snapshot");
+        throw;
+    }
+    execute("DETACH DATABASE snapshot");
 }

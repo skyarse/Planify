@@ -13,7 +13,7 @@ add_library(plan-core src/store.cpp src/caldav.cpp)
 target_link_libraries(plan-core PUBLIC Qt6::Core Qt6::Network Qt6::Sql PkgConfig::LibIcal)
 target_include_directories(plan-core PUBLIC src)
 
-add_executable(plan-tasks src/main.cpp src/window.cpp)
+add_executable(plan-tasks src/main.cpp src/window.cpp src/appearance.cpp src/preferences.cpp)
 target_link_libraries(plan-tasks PRIVATE plan-core Qt6::Widgets)
 
 install(TARGETS plan-tasks RUNTIME DESTINATION bin)

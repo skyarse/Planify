@@ -2,6 +2,7 @@
 #include "store.h"
 
 #include <QCoreApplication>
+#include <QFile>
 #include <QDebug>
 #include <QEventLoop>
 #include <QSqlQuery>
@@ -200,6 +201,57 @@ void localTasks(const QString &path)
     expect(reopened.task(id).title == "Подзадача", "task persists across restart");
 }
 
+void backupTasks(const QTemporaryDir &root)
+{
+    Store source(root.filePath("backup-source.sqlite"));
+    Task first;
+    first.title = "Alpha";
+    first.project = source.addProject("New project");
+    const auto section = source.addSection(first.project, "Section");
+    first.section = section;
+    first.due = QDate::currentDate();
+    const auto firstId = source.saveTask(first);
+    Task second = first;
+    second.parent = firstId;
+    second.title = "Beta";
+    second.priority = 1;
+    second.due = first.due.addDays(-1);
+    const auto secondId = source.saveTask(second);
+    expect(source.count(Page::Today, true) == 1, "overdue count wrong");
+    Filter today;
+    today.page = Page::Today;
+    today.sort = 1;
+    expect(ids(source.query(today)) == QStringList{firstId, secondId}, "title sort wrong");
+    source.toggle(firstId);
+    expect(ids(source.query(today)) == QStringList{secondId}, "completed tasks shown by default");
+    today.showDone = true;
+    expect(ids(source.query(today)) == QStringList{secondId, firstId}, "completed task setting ignored");
+
+    const auto snapshot = root.filePath("backup # copy.sqlite");
+    source.backup(snapshot);
+    Store destination(root.filePath("backup-destination.sqlite"));
+    destination.importBackup(snapshot);
+    expect(destination.projectCounts().value(first.project) == 1 &&
+           destination.task(secondId).parent == firstId &&
+           destination.sections(first.project).first().first == section, "backup structure lost");
+    auto changed = destination.task(secondId);
+    changed.title = "Local edit";
+    destination.saveTask(changed);
+    destination.importBackup(snapshot);
+    expect(destination.task(secondId).title == "Local edit" && destination.projectCounts().value(first.project) == 1,
+           "backup import overwrote newer data or created duplicates");
+    QFile invalid(root.filePath("not-a-backup.sqlite"));
+    expect(invalid.open(QIODevice::WriteOnly) && invalid.write("invalid") == 7, "failed to create corrupt fixture");
+    invalid.close();
+    bool rejected = false;
+    try {
+        destination.importBackup(invalid.fileName());
+    } catch (const std::exception &) {
+        rejected = true;
+    }
+    expect(rejected && destination.task(secondId).title == "Local edit", "invalid backup changed live data");
+}
+
 void remoteTasks(const QString &path)
 {
     Store store(path);
@@ -252,6 +304,7 @@ int main(int argc, char **argv)
         expect(root.isValid(), "temporary directory unavailable");
         localTasks(root.filePath("local.sqlite"));
         remoteTasks(root.filePath("remote.sqlite"));
+        backupTasks(root);
         return 0;
     } catch (const std::exception &error) {
         qCritical("%s", error.what());

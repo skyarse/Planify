@@ -3,6 +3,8 @@
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDir>
+#include <QDialog>
+#include <QSettings>
 #include <QMessageBox>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -73,6 +75,7 @@ int main(int argc, char **argv)
     parser.addOption({"demo", "Запустить с демонстрационными данными"});
     parser.addOption({"smoke-test", "Выполнить проверку интерфейса"});
     parser.addOption({"screenshot", "Сохранить снимок окна", "path"});
+    parser.addOption({"preferences", "Открыть параметры при запуске"});
     parser.process(app);
 
     const bool demo = parser.isSet("demo");
@@ -84,16 +87,27 @@ int main(int argc, char **argv)
         const auto root = temporary ? temporary->path() : QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
         if ((temporary && !temporary->isValid()) || !QDir().mkpath(root))
             throw std::runtime_error("Не удалось создать каталог базы данных");
+        if (smoke) {
+            qputenv("XDG_DATA_HOME", root.toUtf8());
+            QSettings::setDefaultFormat(QSettings::IniFormat);
+            QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, root);
+        }
         Store store(root + "/tasks.sqlite");
         if (demo)
             seedDemo(store);
         Window window(store);
         window.show();
+        std::unique_ptr<QDialog> preferences;
+        if (parser.isSet("preferences")) {
+            preferences.reset(window.makePreferences());
+            preferences->show();
+        }
         if (smoke)
             QTimer::singleShot(0, &app, [&] { app.exit(window.smokeTest() ? 0 : 1); });
         else if (parser.isSet("screenshot"))
             QTimer::singleShot(150, &app, [&] {
-                app.exit(window.grab().save(parser.value("screenshot")) ? 0 : 1);
+                const auto snapshot = preferences ? preferences->grab() : window.grab();
+                app.exit(snapshot.save(parser.value("screenshot")) ? 0 : 1);
             });
         return app.exec();
     } catch (const std::exception &error) {

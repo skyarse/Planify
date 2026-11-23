@@ -1,4 +1,5 @@
 #include "window.h"
+#include "appearance.h"
 
 #include <QAction>
 #include <QApplication>
@@ -35,25 +36,157 @@
 #include <QSqlQueryModel>
 #include <QStyledItemDelegate>
 #include <QTimer>
+#include <QTextBoundaryFinder>
 #include <QVBoxLayout>
+#include <QWindow>
+#include <QGuiApplication>
+#include <QDir>
+#include <QFile>
+#include <QStandardPaths>
 #include <array>
 #include <functional>
+#include <memory>
 
 namespace {
 struct NavItem {
     Page page;
     const char *title;
-    const char *icon;
+    Mark mark;
     const char *color;
 };
 
 constexpr std::array items{
-    NavItem{Page::Inbox, "Входящие", "▣", "#4799ee"},
-    NavItem{Page::Today, "Сегодня", "☆", "#3ebc82"},
-    NavItem{Page::Scheduled, "Предстоящие", "▦", "#b77adb"},
-    NavItem{Page::Pins, "Закреплённые", "◆", "#ee747c"},
-    NavItem{Page::Labels, "Метки", "◇", "#c69a71"},
-    NavItem{Page::Completed, "Завершённые", "✓", "#ef9a48"},
+    NavItem{Page::Inbox, "Входящие", Mark::Inbox, "#3284ed"},
+    NavItem{Page::Today, "Сегодня", Mark::Today, "#20c978"},
+    NavItem{Page::Scheduled, "Предстоящие", Mark::Calendar, "#963bb2"},
+    NavItem{Page::Labels, "Метки", Mark::Tag, "#996940"},
+    NavItem{Page::Pins, "Закреплённые", Mark::Pin, "#d94d63"},
+    NavItem{Page::Completed, "Завершённые", Mark::Complete, "#e78629"},
+};
+
+class NavTile : public QPushButton {
+public:
+    NavTile(const NavItem &info, QWidget *parent) : QPushButton(QString::fromUtf8(info.title), parent), mark(info.mark)
+    {
+        setCheckable(true);
+        setAccessibleName(text());
+        setCursor(Qt::PointingHandCursor);
+        setFixedHeight(65);
+        QFont label = font();
+        label.setPixelSize(14);
+        setFont(label);
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    }
+
+    QColor accent;
+    int count = 0;
+    bool overdue = false;
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        QColor tint = accent;
+        tint.setAlpha(isChecked() || underMouse() ? 46 : 36);
+        painter.setBrush(tint);
+        QColor outline = accent;
+        outline.setAlpha(isChecked() ? 165 : 110);
+        if (isChecked() || hasFocus())
+            painter.setPen(QPen(outline, isChecked() ? 1.8 : 1.0));
+        else
+            painter.setPen(Qt::NoPen);
+        painter.drawRoundedRect(QRectF(rect()).adjusted(1,1,-1,-1), 10, 10);
+        drawMark(painter, mark, QRectF(12,10,18,18), accent, 2.1);
+        painter.setPen(accent);
+        painter.drawText(QRect(13,32,width()-23,27), Qt::AlignVCenter,
+            fontMetrics().elidedText(text(), Qt::ElideRight, width()-23));
+        if (count > 0) {
+            QFont numberFont = font();
+            numberFont.setBold(true);
+            painter.setFont(numberFont);
+            painter.drawText(QRect(33,7,width()-45,24), Qt::AlignRight | Qt::AlignVCenter, QString::number(count));
+        }
+        if (overdue) {
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor("#fa665a"));
+            painter.drawEllipse(QPointF(width()-17,50), 4.5, 4.5);
+        }
+    }
+
+private:
+    Mark mark;
+};
+
+class EmptyMark : public QWidget {
+public:
+    using QWidget::QWidget;
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        drawMark(painter, Mark::Complete, QRectF(rect()).adjusted(2,2,-2,-2),
+                 palette().color(QPalette::PlaceholderText), 2.8);
+    }
+};
+
+class ProjectDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        return {option.rect.width(), index.data(Qt::UserRole).toString().isEmpty() ? 55 : 31};
+    }
+
+    void paint(QPainter *p, const QStyleOptionViewItem &opt, const QModelIndex &idx) const override
+    {
+        const bool account = idx.data(Qt::UserRole).toString().isEmpty();
+        const auto rect = opt.rect.adjusted(2,0,-2,-1);
+        p->save();
+        p->setRenderHint(QPainter::Antialiasing);
+        if (opt.state & (QStyle::State_Selected | QStyle::State_MouseOver)) {
+            p->setPen(Qt::NoPen);
+            p->setBrush(opt.palette.highlight());
+            p->drawRoundedRect(rect, 7, 7);
+        }
+        p->setFont(opt.font);
+        auto label = idx.data().toString();
+        const auto ink = opt.palette.color(QPalette::Text);
+        const auto muted = opt.palette.color(QPalette::PlaceholderText);
+        p->setPen(ink);
+        if (account) {
+            QFont bold = opt.font;
+            bold.setBold(true);
+            p->setFont(bold);
+            p->drawText(rect.adjusted(2,4,-64,-22), Qt::AlignVCenter,
+                QFontMetrics(bold).elidedText(label,Qt::ElideRight,rect.width()-68));
+            p->setFont(opt.font);
+            p->setPen(muted);
+            p->drawText(rect.adjusted(2,25,0,-7), Qt::AlignVCenter, QStringLiteral("протокол CalDAV"));
+            drawMark(*p, Mark::Sync, QRectF(rect.right()-24,15+rect.top(),19,19), ink);
+            p->setPen(opt.palette.color(QPalette::Mid));
+            p->drawLine(rect.bottomLeft(),rect.bottomRight());
+        } else {
+            const auto glyph = idx.data(Qt::UserRole+2).toString();
+            if (glyph.isEmpty())
+                drawMark(*p, Mark::Project, QRectF(rect.left()+1,rect.center().y()-8,16,16), muted, 1.6);
+            else
+                p->drawText(rect.adjusted(1,0,-rect.width()+22,0), Qt::AlignVCenter, glyph);
+            p->drawText(rect.adjusted(26,0,-34,0), Qt::AlignVCenter,
+                opt.fontMetrics.elidedText(label,Qt::ElideRight,rect.width()-62));
+            const int count = idx.data(Qt::UserRole+1).toInt();
+            if (count > 0) {
+                p->setPen(muted);
+                QFont small = opt.font;
+                small.setPointSizeF(qMax(8.0, opt.font.pointSizeF()-1.5));
+                p->setFont(small);
+                p->drawText(rect.adjusted(0,0,-8,0), Qt::AlignRight | Qt::AlignVCenter, QString::number(count));
+            }
+        }
+        p->restore();
+    }
 };
 
 const QDate noDate(1900, 1, 1);
@@ -70,6 +203,7 @@ QLabel *caption(const QString &text, QWidget *parent, const QString &name)
 {
     auto *result = new QLabel(text, parent);
     result->setObjectName(name);
+    result->setTextFormat(Qt::PlainText);
     return result;
 }
 
@@ -175,76 +309,151 @@ private:
 Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
 {
     setWindowTitle(QStringLiteral("План задач"));
-    resize(1120, 740);
-    setMinimumSize(840, 480);
+    setWindowFlag(Qt::FramelessWindowHint);
+    resize(1060, 680);
+    setMinimumSize(760, 470);
+    setWindowIcon(QIcon::fromTheme("local.plan.tasks"));
+    if (QSettings().value("general/rememberWindow", false).toBool() && !qApp->arguments().contains("--smoke-test"))
+        restoreGeometry(QSettings().value("general/geometry").toByteArray());
     systemDark = QApplication::palette().color(QPalette::Window).lightness() < 128;
 
-    auto *root = new QWidget(this);
+    frame = new QWidget(this);
+    frame->setObjectName("frame");
+    frame->installEventFilter(this);
+    setCentralWidget(frame);
+    auto *frameLayout = new QHBoxLayout(frame);
+    frameLayout->setContentsMargins(3, 3, 3, 3);
+
+    auto *root = new QWidget(frame);
     root->setObjectName("windowRoot");
-    setCentralWidget(root);
+    frameLayout->addWidget(root);
     auto *layout = new QHBoxLayout(root);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
 
-    auto *sidebar = new QWidget(root);
+    sidebar = new QWidget(root);
     sidebar->setObjectName("sidebar");
-    sidebar->setFixedWidth(300);
+    sidebar->setFixedWidth(260);
     auto *left = new QVBoxLayout(sidebar);
-    left->setContentsMargins(13, 9, 13, 14);
-    left->setSpacing(12);
-    auto *top = new QHBoxLayout;
-    top->addStretch();
-    auto *findButton = button(QStringLiteral("⌕"), sidebar, "tool");
-    findButton->setAccessibleName(QStringLiteral("Поиск"));
-    findButton->setToolTip(QStringLiteral("Поиск (Ctrl+F)"));
+    left->setContentsMargins(10, 0, 12, 12);
+    left->setSpacing(9);
+    auto *sideHeader = new QWidget(sidebar);
+    sideHeader->setFixedHeight(46);
+    sideHeader->setProperty("windowHeader", true);
+    sideHeader->installEventFilter(this);
+    auto *top = new QHBoxLayout(sideHeader);
+    top->setContentsMargins(0,0,0,0);
+    auto *appIcon = new QLabel(sideHeader);
+    appIcon->setPixmap(windowIcon().isNull() ? markIcon(Mark::Quick, QColor("#3684d9")).pixmap(19) : windowIcon().pixmap(18));
+    top->addWidget(appIcon);
+    auto *findButton = iconButton(sideHeader, Mark::Search, QStringLiteral("Поиск (Ctrl+F)"));
     top->addWidget(findButton);
-    auto *menuButton = button(QStringLiteral("≡"), sidebar, "tool");
-    menuButton->setAccessibleName(QStringLiteral("Меню"));
+    auto *brand = caption(QStringLiteral("План задач"), sideHeader, "brand");
+    brand->setAlignment(Qt::AlignCenter);
+    brand->setAttribute(Qt::WA_TransparentForMouseEvents);
+    top->addWidget(brand, 1);
+    auto *menuButton = iconButton(sideHeader, Mark::Menu, QStringLiteral("Главное меню"));
     top->addWidget(menuButton);
-    left->addLayout(top);
+    left->addWidget(sideHeader);
     auto *menu = new QMenu(menuButton);
-    menuButton->setMenu(menu);
-    menu->addAction(QStringLiteral("Импорт из Baïkal…"), this, &Window::showSync);
-    auto *appearance = menu->addMenu(QStringLiteral("Тема"));
-    appearance->addAction(QStringLiteral("Системная"), this, [this] { setTheme("system"); });
-    appearance->addAction(QStringLiteral("Светлая"), this, [this] { setTheme("light"); });
-    appearance->addAction(QStringLiteral("Тёмная"), this, [this] { setTheme("dark"); });
+    menu->addAction(QStringLiteral("Новый проект"), this, &Window::addLocalProject);
+    menu->addAction(QStringLiteral("Обновить из Baïkal…"), this, &Window::showSync);
+    menu->addSeparator();
+    auto *preferencesAction = menu->addAction(QStringLiteral("Параметры"), QKeySequence(Qt::CTRL | Qt::Key_Comma), this, &Window::showPreferences);
+    addAction(preferencesAction);
+    menu->addAction(QStringLiteral("Выйти"), QKeySequence::Quit, this, &Window::close);
+    connect(menuButton, &QPushButton::clicked, this, [menuButton, menu] {
+        menu->popup(menuButton->mapToGlobal(QPoint(0,menuButton->height())));
+    });
 
     auto *grid = new QGridLayout;
-    grid->setSpacing(7);
+    grid->setSpacing(8);
     for (int i = 0; i < int(items.size()); ++i) {
         const auto &item = items[i];
-        auto *tile = button(QString::fromUtf8(item.icon) + "\n" + QString::fromUtf8(item.title), sidebar, "nav");
-        tile->setAccessibleName(QString::fromUtf8(item.title));
-        tile->setCheckable(true);
+        auto *tile = new NavTile(item, sidebar);
         connect(tile, &QPushButton::clicked, this, [this, page = item.page] { selectPage(page); });
         grid->addWidget(tile, i / 2, i % 2);
         navigation.append(tile);
     }
+    grid->setColumnStretch(0, 1);
+    grid->setColumnStretch(1, 1);
     left->addLayout(grid);
+    left->addSpacing(10);
 
-    auto *projectHeader = new QHBoxLayout;
-    projectHeader->addWidget(caption(QStringLiteral("Проекты"), sidebar, "strong"));
+    localHeading = new QWidget(sidebar);
+    auto *projectHeader = new QHBoxLayout(localHeading);
+    projectHeader->setContentsMargins(1,0,0,0);
+    projectHeader->addWidget(caption(QStringLiteral("На этом компьютере"), localHeading, "strong"));
     projectHeader->addStretch();
-    auto *addProject = button(QStringLiteral("+"), sidebar, "tool");
-    addProject->setAccessibleName(QStringLiteral("Новый проект"));
-    addProject->setToolTip(addProject->accessibleName());
+    auto *addProject = iconButton(localHeading, Mark::Plus, QStringLiteral("Новый локальный проект"));
     projectHeader->addWidget(addProject);
-    left->addLayout(projectHeader);
+    left->addWidget(localHeading);
     projects = new QListWidget(sidebar);
     projects->setObjectName("projects");
     projects->setAccessibleName(QStringLiteral("Проекты"));
+    projects->setItemDelegate(new ProjectDelegate(projects));
+    QFont projectFont = projects->font();
+    projectFont.setPixelSize(14);
+    projects->setFont(projectFont);
+    projects->setMouseTracking(true);
+    projects->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    projects->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     left->addWidget(projects, 1);
-    syncButton = button(QStringLiteral("↻  Baïkal"), sidebar, "sync");
-    syncButton->setToolTip(QStringLiteral("Обновить локальную копию задач Baïkal"));
-    left->addWidget(syncButton);
+    syncButton = button(QStringLiteral("Подключить Baïkal…"), sidebar, "sync");
+    left->addWidget(syncButton, 0, Qt::AlignLeft);
     layout->addWidget(sidebar);
 
     auto *center = new QWidget(root);
     auto *body = new QVBoxLayout(center);
-    body->setContentsMargins(19, 11, 16, 15);
-    body->setSpacing(10);
+    body->setContentsMargins(13, 0, 25, 19);
+    body->setSpacing(8);
+    auto *windowHeader = new QWidget(center);
+    windowHeader->setFixedHeight(46);
+    windowHeader->setProperty("windowHeader", true);
+    windowHeader->installEventFilter(this);
+    auto *controls = new QHBoxLayout(windowHeader);
+    controls->setContentsMargins(0,0,0,0);
+    controls->setSpacing(9);
+    auto *split = iconButton(windowHeader, Mark::Split, QStringLiteral("Показать или скрыть боковую панель"));
+    controls->addWidget(split);
+    controls->addStretch();
+    auto *sort = iconButton(windowHeader, Mark::Sort, QStringLiteral("Сортировка"));
+    auto *sortMenu = new QMenu(sort);
+    const QStringList sortLabels{QStringLiteral("По дате"), QStringLiteral("По названию"), QStringLiteral("По приоритету")};
+    for (int i = 0; i < sortLabels.size(); ++i)
+        sortMenu->addAction(sortLabels[i], this, [this,i] {
+            QSettings().setValue("tasks/sort", i);
+            refresh();
+        });
+    auto *more = iconButton(windowHeader, Mark::More, QStringLiteral("Действия с разделом"));
+    auto *moreMenu = new QMenu(more);
+    moreMenu->addAction(QStringLiteral("Закреплённые"), this, [this] { selectPage(Page::Pins); });
+    moreMenu->addAction(QStringLiteral("Завершённые"), this, [this] { selectPage(Page::Completed); });
+    moreMenu->addSeparator();
+    moreMenu->addAction(QStringLiteral("Параметры"), this, &Window::showPreferences);
+    for (auto entry : {qMakePair(sort,sortMenu),qMakePair(more,moreMenu)}) {
+        controls->addWidget(entry.first);
+        connect(entry.first, &QPushButton::clicked, this, [entry] {
+            entry.second->popup(entry.first->mapToGlobal(QPoint(0,entry.first->height())));
+        });
+    }
+    controls->addSpacing(18);
+    auto *minimize = iconButton(windowHeader, Mark::Minus, QStringLiteral("Свернуть"), "windowControl");
+    auto *maximize = iconButton(windowHeader, Mark::Maximize, QStringLiteral("Развернуть или восстановить"), "windowControl");
+    auto *close = iconButton(windowHeader, Mark::Close, QStringLiteral("Закрыть"), "windowControl");
+    for (auto *control : {minimize, maximize, close})
+        controls->addWidget(control);
+    connect(split, &QPushButton::clicked, this, [this] { sidebar->setVisible(sidebar->isHidden()); });
+    connect(minimize, &QPushButton::clicked, this, &Window::showMinimized);
+    connect(maximize, &QPushButton::clicked, this, [this] { isMaximized() ? showNormal() : showMaximized(); });
+    connect(close, &QPushButton::clicked, this, &Window::close);
+    body->addWidget(windowHeader);
     auto *toolbar = new QHBoxLayout;
+    toolbar->setContentsMargins(34,0,0,0);
+    pageIcon = caption({}, center, "pageIcon");
+    pageIcon->setAlignment(Qt::AlignCenter);
+    pageIcon->setFixedSize(23,23);
+    toolbar->addWidget(pageIcon);
     pageTitle = caption({}, center, "pageTitle");
     toolbar->addWidget(pageTitle, 1);
     labels = new QComboBox(center);
@@ -272,17 +481,39 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     boardArea->setObjectName("board");
     boardArea->hide();
     body->addWidget(boardArea, 1);
-    empty = caption(QStringLiteral("Задач пока нет"), center, "empty");
-    empty->setAlignment(Qt::AlignCenter);
+    empty = new QWidget(center);
+    auto *emptyLayout = new QVBoxLayout(empty);
+    emptyLayout->setContentsMargins(0,0,0,0);
+    emptyLayout->setSpacing(0);
+    emptyLayout->addStretch(5);
+    auto *emptyMark = new EmptyMark(empty);
+    emptyMark->setFixedSize(153,153);
+    emptyLayout->addWidget(emptyMark, 0, Qt::AlignHCenter);
+    emptyLayout->addSpacing(24);
+    emptyTitle = caption({}, empty, "emptyTitle");
+    emptyTitle->setAlignment(Qt::AlignCenter);
+    emptyTitle->setWordWrap(true);
+    emptyLayout->addWidget(emptyTitle);
+    emptyLayout->addSpacing(10);
+    emptyHint = caption({}, empty, "emptyHint");
+    emptyHint->setAlignment(Qt::AlignCenter);
+    emptyHint->setWordWrap(true);
+    emptyLayout->addWidget(emptyHint);
+    emptyLayout->addStretch(6);
+    eventList = new QPlainTextEdit(center);
+    eventList->setObjectName("eventList");
+    eventList->setAccessibleName(QStringLiteral("События календаря"));
+    eventList->setReadOnly(true);
+    eventList->setMaximumHeight(125);
+    eventList->hide();
+    body->insertWidget(3, eventList);
     body->addWidget(empty, 1);
 
     auto *footer = new QHBoxLayout;
     status = caption({}, center, "muted");
     status->setWordWrap(true);
     footer->addWidget(status, 1);
-    auto *addTask = button(QStringLiteral("+"), center, "addTask");
-    addTask->setAccessibleName(QStringLiteral("Создать задачу"));
-    addTask->setToolTip(QStringLiteral("Создать задачу (Ctrl+N)"));
+    auto *addTask = iconButton(center, Mark::Plus, QStringLiteral("Создать задачу (Ctrl+N)"), "addTask");
     footer->addWidget(addTask, 0, Qt::AlignBottom);
     body->addLayout(footer);
     layout->addWidget(center, 1);
@@ -411,7 +642,8 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     connect(remove, &QPushButton::clicked, this, [this] {
         if (current.id.isEmpty() || current.remote())
             return;
-        if (QMessageBox::question(this, QStringLiteral("Удалить задачу?"), current.title) != QMessageBox::Yes)
+        if (QSettings().value("general/confirmDelete", true).toBool()
+            && QMessageBox::question(this, QStringLiteral("Удалить задачу?"), current.title) != QMessageBox::Yes)
             return;
         try {
             store.remove(current.id);
@@ -441,6 +673,13 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     connect(searchShortcut, &QShortcut::activated, this, [this] { search->show(); search->setFocus(); search->selectAll(); });
     auto *newShortcut = new QShortcut(QKeySequence::New, this);
     connect(newShortcut, &QShortcut::activated, this, [this] { newTask(); });
+    quickShortcut = new QShortcut(QKeySequence(Qt::Key_A), this);
+    connect(quickShortcut, &QShortcut::activated, this, [this] {
+        auto *focus = QApplication::focusWidget();
+        if (!qobject_cast<QLineEdit *>(focus) && !qobject_cast<QPlainTextEdit *>(focus)
+            && !qobject_cast<QDateEdit *>(focus))
+            newTask();
+    });
     auto *saveShortcut = new QShortcut(QKeySequence::Save, editor);
     saveShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(saveShortcut, &QShortcut::activated, this, &Window::saveTask);
@@ -467,19 +706,10 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         if (!id.isEmpty())
             selectPage(Page::Project, id);
     });
-    connect(addProject, &QPushButton::clicked, this, [this] {
-        bool ok;
-        const auto name = QInputDialog::getText(this, QStringLiteral("Новый проект"), QStringLiteral("Название"),
-            QLineEdit::Normal, {}, &ok);
-        if (!ok)
-            return;
-        try {
-            const auto id = store.addProject(name);
-            refreshNavigation();
-            selectPage(Page::Project, id);
-        } catch (const std::exception &error) {
-            message(QString::fromUtf8(error.what()));
-        }
+    connect(addProject, &QPushButton::clicked, this, &Window::addLocalProject);
+    connect(projects, &QListWidget::itemClicked, this, [this](const QListWidgetItem *item) {
+        if (item->data(Qt::UserRole).toString().isEmpty())
+            showSync();
     });
     connect(addSection, &QPushButton::clicked, this, [this] {
         bool ok;
@@ -538,8 +768,11 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
             setTheme(theme);
     });
 #endif
-    refreshNavigation();
-    selectPage(Page::Inbox);
+    loadEvents();
+    reloadPreferences();
+    const auto home = QSettings().value("general/home", int(Page::Inbox)).toInt();
+    selectPage(!qApp->arguments().contains("--smoke-test") && home >= int(Page::Inbox) && home <= int(Page::Completed)
+        ? Page(home) : Page::Inbox);
 }
 
 void Window::setTheme(const QString &option)
@@ -548,12 +781,12 @@ void Window::setTheme(const QString &option)
     if (!qApp->arguments().contains("--smoke-test") && !qApp->arguments().contains("--demo"))
         QSettings().setValue("theme", theme);
     const bool dark = theme == "dark" || (theme == "system" && systemDark);
-    const QColor canvas(dark ? "#101116" : "#fafafa");
-    const QColor side(dark ? "#191a21" : "#f1f1f4");
-    const QColor card(dark ? "#1c1e25" : "#f0f1f4");
-    const QColor ink(dark ? "#f0f0f4" : "#202126");
-    const QColor muted(dark ? "#a6a8b5" : "#626572");
-    const QColor line(dark ? "#32343e" : "#d8dbe2");
+    const QColor canvas(dark ? "#101116" : "#f7f7f7");
+    const QColor side(dark ? "#191a21" : "#f0f1f3");
+    const QColor card(dark ? "#24242b" : "#ffffff");
+    const QColor ink(dark ? "#f0f0f4" : "#303137");
+    const QColor muted(dark ? "#a6a8b5" : "#88898e");
+    const QColor line(dark ? "#32343e" : "#dadce0");
     QPalette colors = QApplication::palette();
     colors.setColor(QPalette::Window, canvas);
     colors.setColor(QPalette::WindowText, ink);
@@ -566,11 +799,29 @@ void Window::setTheme(const QString &option)
     colors.setColor(QPalette::PlaceholderText, muted);
     colors.setColor(QPalette::ButtonText, ink);
     colors.setColor(QPalette::Button, card);
+    colors.setColor(QPalette::Mid, line);
     QApplication::setPalette(colors);
     setPalette(colors);
     auto css = QStringLiteral(R"CSS(
         QLabel, QCheckBox, QListWidget#projects, QPushButton { color: %2; }
-        QWidget#windowRoot { background: %1; color: %2; }
+        QWidget#frame, QWidget#windowRoot, QDialog#preferences, QWidget#settingsPage { background: %1; color: %2; }
+        QDialog#preferences { border: 1px solid %4; border-radius: 11px; }
+        QLabel#brand, QLabel#settingsTitle { font-size: 14px; font-weight: bold; }
+        QLabel#pageIcon { background: rgba(51,132,237,30); border-radius: 6px; }
+        QScrollArea#preferencesScroll { background: transparent; border: 0; }
+        QScrollBar:vertical { background: transparent; border: 0; width: 6px; margin: 2px 0; }
+        QScrollBar::handle:vertical { background: %4; border-radius: 3px; min-height: 24px; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        QWidget#settingsGroup { background: %7; border: 1px solid %4; border-radius: 13px; }
+        QPushButton#settingsRow { text-align: left; padding: 8px 12px; border: 0; border-bottom: 1px solid %4; background: transparent; }
+        QPushButton#settingsRow[last="true"] { border-bottom: 0; }
+        QPushButton#settingsRow:hover, QPushButton#windowControl:hover { background: %5; }
+        QPushButton#windowControl { background: %4; border: 0; border-radius: 14px; }
+        QLabel#settingsRowTitle { font-size: 14px; }
+        QLabel#settingsRowHint { color: %6; font-size: 11px; }
+        QLabel#settingsHint { color: %6; }
+        QPlainTextEdit#eventList { background: %7; border: 1px solid %4; border-radius: 8px; padding: 4px 7px; }
         QWidget#sidebar, QScrollArea#editor, QScrollArea#editor > QWidget > QWidget { background: %3; color: %2; }
         QWidget#sidebar { border-right: 1px solid %4; }
         QScrollArea#editor { border: 0; border-left: 1px solid %4; }
@@ -578,40 +829,89 @@ void Window::setTheme(const QString &option)
         QListWidget#projects::item { padding: 6px 5px; border-radius: 5px; }
         QListWidget#projects::item:selected { background: %5; color: %2; }
         QLabel#strong, QLabel#pageTitle { font-weight: 650; }
-        QLabel#pageTitle { font-size: 16px; padding: 5px 1px; }
-        QLabel#empty, QLabel#muted { color: %6; }
+        QLabel#pageTitle { font-size: 19px; padding: 2px 0; }
+        QLabel#emptyTitle { font-size: 25px; font-weight: bold; }
+        QLabel#emptyHint { font-size: 14px; }
+        QLabel#muted { color: %6; }
         QPushButton#tool { background: transparent; border: 0; border-radius: 6px; min-width: 30px; min-height: 29px; font-size: 17px; }
         QPushButton#tool:hover, QPushButton#secondary:hover, QPushButton#sync:hover { background: %5; }
         QPushButton#secondary, QPushButton#sync { padding: 6px 9px; border-radius: 6px; border: 1px solid %4; }
         QPushButton#primary { background: #287bcc; color: white; border: 0; border-radius: 6px; padding: 8px 14px; }
-        QPushButton#addTask { background: #3283d7; color: white; font-size: 24px; border: 0; border-radius: 22px;
-                             min-width: 44px; max-width: 44px; min-height: 44px; max-height: 44px; }
+        QPushButton#addTask { background: #3283d7; color: white; font-size: 24px; border: 0; border-radius: 25px;
+                             min-width: 50px; max-width: 50px; min-height: 50px; max-height: 50px; }
         QPushButton#addTask:hover, QPushButton#primary:hover { background: #2670b7; }
         QPushButton:disabled { color: %6; }
         QLineEdit, QPlainTextEdit, QComboBox, QDateEdit { border: 1px solid %4; border-radius: 6px; padding: 5px;
                                                         background: %1; color: %2; }
         QLineEdit:focus, QPlainTextEdit:focus, QPushButton#nav:focus { border: 1px solid #539be6; }
-        QPushButton#nav { min-height: 48px; border-radius: 8px; padding: 2px 9px; text-align: left; font-weight: 650; }
-    )CSS").arg(canvas.name(), ink.name(), side.name(), line.name(), colors.color(QPalette::Highlight).name(), muted.name());
+    )CSS").arg(canvas.name(), ink.name(), side.name(), line.name(), colors.color(QPalette::Highlight).name(), muted.name(), card.name());
     for (int i = 0; i < navigation.size(); ++i) {
-        auto *tile = navigation[i];
-        const auto id = QStringLiteral("nav%1").arg(i);
-        tile->setObjectName(id);
-        const QColor accent(QString::fromLatin1(items[i].color));
-        const auto tint = [&](qreal strength) {
-            return QColor::fromRgbF(side.redF() + (accent.redF() - side.redF()) * strength,
-                                    side.greenF() + (accent.greenF() - side.greenF()) * strength,
-                                    side.blueF() + (accent.blueF() - side.blueF()) * strength).name();
-        };
-        css += QStringLiteral(
-            "QPushButton#%1 { min-height:48px; border-radius:8px; padding:2px 9px; text-align:left;"
-            " font-weight:650; background:%2; color:%3; border:1px solid %2; }"
-            " QPushButton#%1:hover { background:%4; }"
-            " QPushButton#%1:checked, QPushButton#%1:focus { border-color:%3; }")
-            .arg(id, tint(dark ? 0.15 : 0.12), dark ? accent.name() : accent.darker(165).name(),
-                 tint(dark ? 0.26 : 0.20));
+        auto *tile = static_cast<NavTile *>(navigation[i]);
+        tile->accent = QColor(QString::fromLatin1(items[i].color));
+        if (dark && (items[i].page == Page::Scheduled || items[i].page == Page::Labels))
+            tile->accent = tile->accent.lighter(140);
+        tile->update();
     }
     setStyleSheet(css);
+}
+
+bool Window::eventFilter(QObject *object, QEvent *event)
+{
+    if (event->type() != QEvent::MouseButtonPress && event->type() != QEvent::MouseButtonDblClick)
+        return QMainWindow::eventFilter(object, event);
+    auto *mouse = static_cast<QMouseEvent *>(event);
+    if (mouse->button() != Qt::LeftButton || !windowHandle())
+        return QMainWindow::eventFilter(object, event);
+    if (object->property("windowHeader").toBool()) {
+        if (event->type() == QEvent::MouseButtonDblClick)
+            isMaximized() ? showNormal() : showMaximized();
+        else
+            windowHandle()->startSystemMove();
+        return true;
+    }
+    if (object == frame && !isMaximized()) {
+        const auto point = mouse->position();
+        Qt::Edges edges;
+        if (point.x() < 4) edges |= Qt::LeftEdge;
+        else if (point.x() >= frame->width()-4) edges |= Qt::RightEdge;
+        if (point.y() < 4) edges |= Qt::TopEdge;
+        else if (point.y() >= frame->height()-4) edges |= Qt::BottomEdge;
+        if (edges)
+            return windowHandle()->startSystemResize(edges);
+    }
+    return QMainWindow::eventFilter(object, event);
+}
+
+void Window::addLocalProject()
+{
+    bool ok = false;
+    const auto name = QInputDialog::getText(this, QStringLiteral("Новый проект"), QStringLiteral("Название"),
+        QLineEdit::Normal, {}, &ok);
+    if (!ok)
+        return;
+    try {
+        const auto id = store.addProject(name);
+        refreshNavigation();
+        selectPage(Page::Project, id);
+    } catch (const std::exception &error) {
+        message(QString::fromUtf8(error.what()));
+    }
+}
+
+void Window::reloadPreferences()
+{
+    const QSettings settings;
+    for (int i = 0; i < navigation.size(); ++i) {
+        const auto page = items[i].page;
+        const bool visible = (page != Page::Pins || settings.value("sidebar/pins", false).toBool())
+            && (page != Page::Completed || settings.value("sidebar/completed", false).toBool());
+        navigation[i]->setVisible(visible);
+    }
+    quickShortcut->setEnabled(settings.value("quick/enabled", true).toBool());
+    quickShortcut->setKey(settings.value("quick/control", false).toBool()
+        ? QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_A) : QKeySequence(Qt::Key_A));
+    refreshNavigation();
+    refresh();
 }
 
 void Window::selectPage(Page page, const QString &id)
@@ -638,23 +938,39 @@ void Window::refreshNavigation()
     const auto selected = filter.project;
     projects->clear();
     QString group;
+    bool hasLocal = false;
+    bool hasRemote = false;
+    const bool showLocal = QSettings().value("sidebar/local", true).toBool();
     const auto entries = store.projects();
     for (const auto &entry : entries) {
-        if (projects->count() == 0 || group != entry.account) {
+        if (!entry.remote() && !showLocal)
+            continue;
+        if (entry.remote() && group != entry.account) {
             group = entry.account;
-            auto *header = new QListWidgetItem(group.isEmpty() ? QStringLiteral("На этом компьютере")
-                : QStringLiteral("Baïkal · %1").arg(group), projects);
-            header->setFlags(Qt::NoItemFlags);
-            QFont font = header->font();
-            font.setBold(true);
-            header->setFont(font);
-            header->setForeground(palette().color(QPalette::PlaceholderText));
+            auto *header = new QListWidgetItem(group, projects);
+            header->setFlags(Qt::ItemIsEnabled);
+            header->setToolTip(QStringLiteral("Обновить локальную копию из Baïkal"));
         }
-        auto *item = new QListWidgetItem(QStringLiteral("◯  %1").arg(entry.title), projects);
+        hasLocal |= !entry.remote();
+        hasRemote |= entry.remote();
+        auto name = entry.title;
+        auto *item = new QListWidgetItem(name, projects);
+        const auto first = name.toUcs4().value(0);
+        if (first >= 0x1F000 || (first >= 0x2300 && first <= 0x27BF)) {
+            QTextBoundaryFinder grapheme(QTextBoundaryFinder::Grapheme, name);
+            const auto boundary = grapheme.toNextBoundary();
+            if (boundary > 0 && boundary < name.size() && name.at(boundary).isSpace()) {
+                item->setData(Qt::UserRole+2, name.left(boundary));
+                item->setText(name.mid(boundary).trimmed());
+            }
+        }
         item->setData(Qt::UserRole, entry.id);
+        item->setToolTip(entry.title);
         if (entry.id == selected)
             projects->setCurrentItem(item);
     }
+    localHeading->setVisible(showLocal && (hasLocal || !hasRemote));
+    syncButton->setVisible(!hasRemote);
     const QSignalBlocker block(labels);
     labels->clear();
     labels->addItem(QStringLiteral("Все метки"), "");
@@ -662,27 +978,57 @@ void Window::refreshNavigation()
         labels->addItem(tag, tag);
     selectData(labels, filter.tag);
     filter.tag = labels->currentData().toString();
+    refreshCounts();
+}
+
+void Window::refreshCounts()
+{
+    const bool showCounts = QSettings().value("sidebar/counts", true).toBool();
+    const auto counts = showCounts ? store.projectCounts() : QHash<QString,int>();
+    for (int i = 0; i < projects->count(); ++i) {
+        auto *item = projects->item(i);
+        item->setData(Qt::UserRole+1, counts.value(item->data(Qt::UserRole).toString()));
+    }
+    const int labelCount = labels->count()-1;
+    for (int i = 0; i < navigation.size(); ++i) {
+        auto *tile = static_cast<NavTile *>(navigation[i]);
+        const auto page = items[i].page;
+        tile->count = !showCounts || page == Page::Scheduled ? 0 : page == Page::Labels ? labelCount : store.count(page);
+        tile->overdue = page == Page::Today && store.count(Page::Today,true) > 0;
+        tile->update();
+    }
 }
 
 void Window::refresh()
 {
     try {
         const auto selected = store.project(filter.project);
+        const QSettings settings;
+        filter.sort = settings.value("tasks/sort", 0).toInt();
+        filter.showDone = settings.value("tasks/showDoneToday", false).toBool();
+        refreshEvents();
         const bool projectPage = filter.page == Page::Project && filter.search.isEmpty();
         labels->setVisible(filter.page == Page::Labels && filter.search.isEmpty());
         addSection->setVisible(projectPage && !selected.remote());
         boardButton->setVisible(projectPage);
         boardButton->setText(board ? QStringLiteral("Список") : QStringLiteral("Доска"));
+        auto mark = Mark::Project;
+        auto color = palette().color(QPalette::WindowText);
         if (!filter.search.isEmpty()) {
+            mark = Mark::Search;
             pageTitle->setText(QStringLiteral("Результаты поиска"));
         } else if (projectPage) {
             pageTitle->setText(selected.title);
         } else {
             for (const auto &item : items)
-                if (filter.page == item.page)
+                if (filter.page == item.page) {
                     pageTitle->setText(QString::fromUtf8(item.title));
+                    mark = item.mark;
+                    color = QColor(QString::fromLatin1(item.color));
+                }
         }
 
+        pageIcon->setPixmap(markIcon(mark,color).pixmap(20));
         const bool showBoard = board && projectPage;
         auto *scroll = static_cast<QScrollArea *>(boardArea);
         delete scroll->takeWidget();
@@ -698,7 +1044,12 @@ void Window::refresh()
         }
         boardArea->setVisible(showBoard);
         list->setVisible(!showBoard && model->rowCount() > 0);
-        empty->setText(filter.search.isEmpty() ? QStringLiteral("Задач пока нет") : QStringLiteral("Ничего не найдено"));
+        emptyTitle->setText(!filter.search.isEmpty() ? QStringLiteral("Ничего не найдено")
+            : filter.page == Page::Inbox ? QStringLiteral("Добавить несколько задач")
+            : QStringLiteral("Задач пока нет"));
+        emptyHint->setVisible(filter.search.isEmpty());
+        const auto action = !quickShortcut->isEnabled() ? QStringLiteral("Ctrl+N") : quickShortcut->key().toString();
+        emptyHint->setText(QStringLiteral("Нажмите клавишу «%1», чтобы создать новую задачу").arg(action.toLower()));
         empty->setVisible(!showBoard && model->rowCount() == 0);
     } catch (const std::exception &error) {
         message(QString::fromUtf8(error.what()));
@@ -825,6 +1176,7 @@ void Window::newTask(const QString &parent)
         return;
     Task task;
     task.project = Store::inbox();
+    task.priority = qBound(0, QSettings().value("tasks/defaultPriority", 0).toInt(), 3);
     task.parent = parent;
     if (!parent.isEmpty()) {
         task.project = current.project;
@@ -901,6 +1253,7 @@ void Window::toggleTask(const QString &id)
             return;
         }
         store.toggle(id);
+        refreshCounts();
         refresh();
         if (editor->isVisible() && current.id == id)
             editTask(store.task(id));
@@ -932,8 +1285,11 @@ bool Window::mayDiscard()
 
 void Window::closeEvent(QCloseEvent *event)
 {
-    if (mayDiscard())
+    if (mayDiscard()) {
+        if (QSettings().value("general/rememberWindow", false).toBool())
+            QSettings().setValue("general/geometry", saveGeometry());
         event->accept();
+    }
     else
         event->ignore();
 }
@@ -1002,5 +1358,46 @@ bool Window::smokeTest()
     selectPage(Page::Project, sample);
     board = true;
     refresh();
-    return boardArea->isVisible() && boardModels.size() == 2;
+    if (!boardArea->isVisible() || boardModels.size() != 2)
+        return false;
+
+    std::unique_ptr<QDialog> prefs(makePreferences());
+    int categories = 0;
+    for (auto *button : prefs->findChildren<QPushButton *>()) {
+        if (button->objectName() == "settingsRow")
+            ++categories;
+        if (button->accessibleName() == QStringLiteral("Боковая панель"))
+            button->click();
+    }
+    if (categories != 10 || !navigation[4]->isHidden())
+        return false;
+    for (auto *check : prefs->findChildren<QCheckBox *>()) {
+        if (check->text() == QStringLiteral("Показывать «Закреплённые»")) {
+            check->click();
+            if (navigation[4]->isHidden() || !QSettings().value("sidebar/pins").toBool())
+                return false;
+
+            const QString id = QStringLiteral("4dbbef64-4dcb-4cc3-a7d2-6acb9752f07e");
+            const auto dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/calendars";
+            QDir().mkpath(dir);
+            QFile source(dir + '/' + id + ".ics");
+            if (!source.open(QIODevice::WriteOnly))
+                return false;
+            const auto date = QDate::currentDate().toString("yyyyMMdd").toLatin1();
+            source.write("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\n"
+                         "UID:sample-event\r\nDTSTAMP:" + date + "T070000Z\r\nDTSTART;VALUE=DATE:" + date
+                         + "\r\nSUMMARY:Sample calendar event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+            source.close();
+            QSettings().setValue("calendar/sources", QVariantMap{{id,"Fixture"}});
+            loadEvents();
+            selectPage(Page::Today);
+            if (!eventList->isVisible() || !eventList->toPlainText().contains("Sample calendar event"))
+                return false;
+            QSettings().setValue("calendar/enabled/"+id,false);
+            loadEvents();
+            refreshEvents();
+            return eventList->isHidden();
+        }
+    }
+    return false;
 }

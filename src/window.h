@@ -4,10 +4,13 @@
 #include "store.h"
 
 #include <QMainWindow>
+#include <QMap>
 #include <optional>
 
 class QCheckBox;
 class QCloseEvent;
+class QDialog;
+class QShortcut;
 class QComboBox;
 class QDateEdit;
 class QLabel;
@@ -23,9 +26,11 @@ class Window : public QMainWindow {
 public:
     explicit Window(Store &store, QWidget *parent = nullptr);
     bool smokeTest();
+    QDialog *makePreferences();
 
 protected:
     void closeEvent(QCloseEvent *event) override;
+    bool eventFilter(QObject *object, QEvent *event) override;
 
 private:
     Store &store;
@@ -38,12 +43,21 @@ private:
     bool syncing = false;
     bool systemDark = false;
     QString theme;
+    QMap<QDate, QStringList> calendarEvents;
     QComboBox *labels;
     QListWidget *projects;
     QLineEdit *search;
     QLabel *pageTitle;
+    QLabel *pageIcon;
+    QLabel *emptyTitle;
+    QLabel *emptyHint;
+    QPlainTextEdit *eventList;
+    QWidget *sidebar;
+    QWidget *frame;
+    QWidget *localHeading;
+    QShortcut *quickShortcut;
     QLabel *status;
-    QLabel *empty;
+    QWidget *empty;
     QListView *list;
     QWidget *boardArea;
     QWidget *editor;
@@ -73,6 +87,12 @@ private:
     void setTheme(const QString &option);
     void selectPage(Page page, const QString &id = {});
     void refreshNavigation();
+    void refreshCounts();
+    void reloadPreferences();
+    void refreshEvents();
+    void loadEvents();
+    void addLocalProject();
+    void showPreferences();
     void refresh();
     void rebuildBoard();
     QListView *createTaskList(QWidget *parent, QSqlQueryModel *taskModel);

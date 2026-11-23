@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QDate>
+#include <QHash>
 #include <QList>
 #include <QUrl>
 #include <QSqlDatabase>
@@ -51,6 +52,8 @@ struct Filter {
     QString tag;
     std::optional<QString> section;
     QString parent;
+    int sort = 0;
+    bool showDone = false;
 };
 
 class QSqlQuery;
@@ -67,6 +70,10 @@ public:
     Project project(const QString &id) const;
     Task task(const QString &id) const;
     QStringList labels() const;
+    QHash<QString, int> projectCounts() const;
+    int count(Page page, bool overdueOnly = false) const;
+    void backup(const QString &path);
+    void importBackup(const QString &path);
     QString addProject(const QString &title);
     QString addSection(const QString &project, const QString &title);
     QString saveTask(Task task);
