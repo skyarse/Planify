@@ -10,6 +10,7 @@
 #include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QTimeZone>
 #include <stdexcept>
 
 namespace {
@@ -56,6 +57,11 @@ struct MockServer {
     bool recurring = false;
     bool malformedParent = false;
     bool duplicateParent = false;
+    QByteArray serverCalendar;
+    QByteArray receivedTag;
+    QByteArray responseTag = R"("v1")";
+    bool conflict = false;
+    int writes = 0;
     qsizetype skipped = 0;
     qsizetype recovered = 0;
 
@@ -97,6 +103,7 @@ struct MockServer {
         QByteArray body;
         QByteArray status = "207 Multi-Status";
         QByteArray challenge;
+        QByteArray etag;
         if (!hasAuth) {
             status = "401 Unauthorized";
             challenge = "WWW-Authenticate: Basic realm=\"fixture\"\r\n";
@@ -114,6 +121,22 @@ struct MockServer {
                 "</c:supported-calendar-component-set>") +
                 response(path + "events/", "<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>"
                 "<c:supported-calendar-component-set><c:comp name='VEVENT'/></c:supported-calendar-component-set>"));
+        } else if (method == "PUT" && path == "/dav.php/calendars/demo/tasks/first.ics") {
+            ++writes;
+            for (const auto &header : headers)
+                if (header.toLower().startsWith("if-match:"))
+                    receivedTag = header.mid(9).trimmed();
+            if (conflict || receivedTag != responseTag) {
+                status = "412 Precondition Failed";
+            } else {
+                serverCalendar = received.mid(split + 4, length);
+                responseTag = responseTag == "\"v1\"" ? "\"v2\"" : "\"v3\"";
+                status = "204 No Content";
+            }
+        } else if (method == "GET" && path == "/dav.php/calendars/demo/tasks/first.ics" && !serverCalendar.isEmpty()) {
+            status = "200 OK";
+            etag = "ETag: " + responseTag + "\r\n";
+            body = serverCalendar;
         } else if (method == "REPORT" && path == "/dav.php/calendars/demo/tasks/") {
             validQuery = received.mid(split + 4).contains("name='VTODO'");
             QByteArray tasks;
@@ -142,9 +165,34 @@ struct MockServer {
             status = "404 Not Found";
         }
         socket->write("HTTP/1.1 " + status + "\r\nContent-Type: application/xml; charset=utf-8\r\n"
-            "Connection: close\r\n" + challenge + "Content-Length: " + QByteArray::number(body.size()) +
+            "Connection: close\r\n" + challenge + etag + "Content-Length: " + QByteArray::number(body.size()) +
             "\r\n\r\n" + body);
         socket->disconnectFromHost();
+    }
+
+    bool edit(Store &store, const Task &original, Task draft)
+    {
+        CalDav client;
+        QEventLoop loop;
+        bool updated = false;
+        QString error;
+        QObject::connect(&client, &CalDav::updated, &loop, [&](const Task &before, const Task &after) {
+            store.updateRemote(before, after);
+            updated = true;
+            loop.quit();
+        });
+        QObject::connect(&client, &CalDav::failed, &loop, [&](const QString &reason) {
+            error = reason;
+            loop.quit();
+        });
+        const auto url = QUrl(QString("http://127.0.0.1:%1/dav.php").arg(server.serverPort()));
+        expect(client.connectAccount(url, "demo", "local"), "mock account not connected");
+        if (client.update(store.project(original.project), original, draft)) {
+            QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+            loop.exec();
+        }
+        expect(updated || !error.isEmpty(), "mock write timed out");
+        return updated;
     }
 
     bool import(Store &store)
@@ -206,7 +254,10 @@ void localTasks(const QString &path)
         expect(store.labels() == QStringList{"Работа"}, "deduplicated label");
         store.toggle(id);
         const auto repeated = store.task(id);
-        expect(repeated.due == task.due.addDays(7) && !repeated.done, "weekly repeat");
+        expect(repeated.due == task.due.addDays(7) && !repeated.done && repeated.completed.isValid(), "weekly repeat");
+        task.reminder = QDateTime::currentDateTimeUtc().addSecs(60);
+        task.attachments = {"https://example.org/fixture"};
+        task.taskTemplate = true;
         task.parent = id;
         task.title = "Подзадача";
         const auto child = store.saveTask(task);
@@ -224,7 +275,10 @@ void localTasks(const QString &path)
         id = child;
     }
     Store reopened(path);
-    expect(reopened.task(id).title == "Подзадача", "task persists across restart");
+    const auto reopenedTask = reopened.task(id);
+    expect(reopenedTask.title == "Подзадача" && reopenedTask.reminder.isValid() &&
+           reopenedTask.attachments == QStringList{"https://example.org/fixture"} && reopenedTask.taskTemplate,
+           "task card fields did not persist across restart");
 }
 
 void backupTasks(const QTemporaryDir &root)
@@ -248,6 +302,9 @@ void backupTasks(const QTemporaryDir &root)
     today.page = Page::Today;
     today.sort = 1;
     expect(ids(source.query(today)) == QStringList{firstId, secondId}, "title sort wrong");
+    second.attachments = {"https://example.org/backup"};
+    second.id = secondId;
+    source.saveTask(second);
     source.toggle(firstId);
     expect(ids(source.query(today)) == QStringList{secondId}, "completed tasks shown by default");
     today.showDone = true;
@@ -259,6 +316,8 @@ void backupTasks(const QTemporaryDir &root)
     destination.importBackup(snapshot);
     expect(destination.projectCounts().value(first.project) == 1 &&
            destination.task(secondId).parent == firstId &&
+           destination.task(secondId).attachments == second.attachments &&
+           destination.task(firstId).completed.isValid() &&
            destination.sections(first.project).first().first == section, "backup structure lost");
     auto changed = destination.task(secondId);
     changed.title = "Local edit";
@@ -354,6 +413,55 @@ void remoteTasks(const QString &path)
     for (const auto &method : mock.methods)
         expect(method == "PROPFIND" || method == "REPORT", "unexpected write request");
 }
+
+void remoteWrites(const QString &path)
+{
+    Store store(path);
+    MockServer mock;
+    expect(mock.import(store), "mock import for write failed");
+    const auto project = store.projects().first();
+    Filter page;
+    page.page = Page::Project;
+    page.project = project.id;
+    const auto tasks = ids(store.query(page));
+    const auto original = store.task(tasks.first());
+    const auto child = store.task(tasks.last());
+    auto draft = original;
+    draft.done = true;
+    draft.priority = 2;
+    draft.tags = "alpha, beta";
+    draft.due = QDate(2026, 12, 5);
+    draft.reminder = QDateTime(QDate(2026, 12, 4), QTime(14, 35), QTimeZone::utc());
+    draft.attachments = {"https://example.org/main"};
+    expect(mock.edit(store, original, draft), "conditional completion failed");
+    const auto completed = store.task(original.id);
+    expect(mock.writes == 1 && mock.receivedTag == original.etag.toLatin1() &&
+           completed.etag == QString::fromLatin1(mock.responseTag) && completed.done &&
+           completed.completed.isValid() && completed.due == draft.due && completed.priority == draft.priority &&
+           completed.tags == draft.tags && completed.reminder == draft.reminder && completed.attachments == draft.attachments,
+           "confirmed fields or fresh ETag missing");
+    expect(mock.serverCalendar.contains("X-CUSTOM:must-survive") && mock.serverCalendar.contains("UID:uid-a") &&
+           store.task(child.id).parent == original.id && ids(store.query(page)) == QStringList{child.id},
+           "write damaged unmodeled data or child task");
+    mock.conflict = true;
+    draft = completed;
+    draft.done = false;
+    expect(!mock.edit(store, completed, draft) && store.task(original.id).done && mock.writes == 2,
+           "conflict overwrote local or server state");
+    mock.conflict = false;
+    expect(mock.edit(store, completed, draft) && !store.task(original.id).done &&
+           store.task(original.id).completed.isValid(), "reopening failed or lost completion history");
+    mock.recurring = true;
+    expect(mock.import(store), "could not import recurring task");
+    const auto recurring = store.task(original.id);
+    draft = recurring;
+    draft.done = true;
+    expect(!mock.edit(store, recurring, draft) && mock.writes == 3 &&
+           store.task(original.id).calendarData.contains("RECURRENCE-ID"),
+           "update overwrote a recurring VTODO");
+    expect(CalDav::exportTask(completed) == completed.calendarData, "export changed remote calendar");
+}
+
 }
 
 int main(int argc, char **argv)
@@ -364,6 +472,7 @@ int main(int argc, char **argv)
         expect(root.isValid(), "temporary directory unavailable");
         localTasks(root.filePath("local.sqlite"));
         remoteTasks(root.filePath("remote.sqlite"));
+        remoteWrites(root.filePath("remote-writes.sqlite"));
         backupTasks(root);
         return 0;
     } catch (const std::exception &error) {

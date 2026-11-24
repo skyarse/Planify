@@ -251,8 +251,8 @@ QDialog *Window::makePreferences()
 
     const auto account = QSettings().value("dav/user").toString();
     const auto address = QSettings().value("dav/address").toString();
-    info(0, account.isEmpty() ? QStringLiteral("Подключите Baïkal, чтобы просматривать задачи без интернета.")
-        : QStringLiteral("%1\n%2\nЛокальная копия задач доступна для просмотра.").arg(account,address));
+    info(0, account.isEmpty() ? QStringLiteral("Подключите Baïkal, чтобы загрузить и обновлять списки задач.")
+        : QStringLiteral("%1\n%2\nЛокальная копия задач доступна без интернета.").arg(account,address));
     action(0, account.isEmpty() ? QStringLiteral("Подключить Baïkal…") : QStringLiteral("Настроить и обновить Baïkal…"),
         [this,dialog] { dialog->accept(); showSync(); });
 

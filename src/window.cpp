@@ -6,7 +6,11 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
-#include <QCursor>
+#include <QClipboard>
+#include <QDesktopServices>
+#include <QFileDialog>
+#include <QStackedWidget>
+#include <QSaveFile>
 #include <QLocale>
 #include <QSignalBlocker>
 #include <QSqlQuery>
@@ -36,6 +40,7 @@
 #include <QSqlQueryModel>
 #include <QStyledItemDelegate>
 #include <QTimer>
+#include <QToolTip>
 #include <QTextBoundaryFinder>
 #include <QVBoxLayout>
 #include <QWindow>
@@ -190,6 +195,12 @@ public:
 };
 
 const QDate noDate(1900, 1, 1);
+const QDateTime noReminder(noDate, QTime(0, 0));
+
+QRect completionHit(const QRect &row)
+{
+    return QRect(row.left() + 8, row.top() + 14, 26, 26);
+}
 
 QPushButton *button(const QString &text, QWidget *parent, const QString &name = {})
 {
@@ -214,22 +225,25 @@ void selectData(QComboBox *box, const QString &data)
 
 class TaskDelegate : public QStyledItemDelegate {
 public:
-    TaskDelegate(std::function<void(const QString &)> toggle, QObject *parent)
-        : QStyledItemDelegate(parent), toggle(std::move(toggle)) {}
+    using QStyledItemDelegate::QStyledItemDelegate;
 
-    QSize sizeHint(const QStyleOptionViewItem &, const QModelIndex &) const override
+    QString expandedId;
+    int expandedHeight = 55;
+
+    QSize sizeHint(const QStyleOptionViewItem &, const QModelIndex &index) const override
     {
-        return {0, 55};
+        return {0, !expandedId.isEmpty() && index.data().toString() == expandedId ? expandedHeight : 55};
     }
 
     void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
     {
+        if (!expandedId.isEmpty() && index.data().toString() == expandedId)
+            return;
         const auto value = [&](int column) {
             return index.siblingAtColumn(column).data();
         };
         const bool done = value(2).toBool();
         const int priority = value(3).toInt();
-        const bool child = !value(6).toString().isEmpty();
         const auto palette = option.widget ? option.widget->window()->palette() : option.palette;
         const auto rect = option.rect.adjusted(1, 1, -1, -2);
         painter->save();
@@ -247,7 +261,7 @@ public:
         if (priority == 1) accent = QColor("#ed727a");
         if (priority == 2) accent = QColor("#e19a52");
         if (priority == 3) accent = QColor("#559ce3");
-        const QRect check(rect.left() + (child ? 26 : 12), rect.top() + 19, 17, 17);
+        const QRect check(rect.left() + 12, rect.top() + 19, 17, 17);
         painter->setPen(QPen(done ? QColor("#4fb388") : accent, 1.6));
         painter->setBrush(Qt::NoBrush);
         painter->drawEllipse(check);
@@ -286,24 +300,67 @@ public:
         painter->restore();
     }
 
-    bool editorEvent(QEvent *event, QAbstractItemModel *, const QStyleOptionViewItem &option,
-                     const QModelIndex &index) override
+};
+
+class TaskView : public QListView {
+public:
+    TaskView(std::function<void(const QString &)> toggle, QWidget *parent)
+        : QListView(parent), toggle(std::move(toggle)) {}
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override
     {
-        if (event->type() != QEvent::MouseButtonRelease)
-            return false;
-        const auto *mouse = static_cast<QMouseEvent *>(event);
-        const bool child = !index.siblingAtColumn(6).data().toString().isEmpty();
-        const QRect hit(option.rect.left() + (child ? 23 : 8), option.rect.top() + 14, 26, 26);
-        if (mouse->button() != Qt::LeftButton || !hit.contains(mouse->position().toPoint()))
-            return false;
-        const auto id = index.siblingAtColumn(0).data().toString();
-        QTimer::singleShot(0, this, [this, id] { toggle(id); });
-        return true;
+        const auto index = checkAt(event);
+        if (!index.isValid()) {
+            QListView::mousePressEvent(event);
+            return;
+        }
+        checkPressed = true;
+        pressed = index;
+        setFocus(Qt::MouseFocusReason);
+        event->accept();
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (!checkPressed) {
+            QListView::mouseReleaseEvent(event);
+            return;
+        }
+        const auto index = checkAt(event);
+        const bool toggleHere = index.isValid() && pressed == index;
+        checkPressed = false;
+        pressed = QPersistentModelIndex();
+        event->accept();
+        if (toggleHere)
+            toggle(index.data().toString());
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        if (!checkAt(event).isValid()) {
+            QListView::mouseDoubleClickEvent(event);
+            return;
+        }
+        checkPressed = true;
+        pressed = QPersistentModelIndex();
+        event->accept();
     }
 
 private:
+    QModelIndex checkAt(const QMouseEvent *event) const
+    {
+        const auto point = event->position().toPoint();
+        const auto index = indexAt(point);
+        return event->button() == Qt::LeftButton && index.isValid() && !indexWidget(index) &&
+            completionHit(visualRect(index)).contains(point) ? index : QModelIndex();
+    }
+
     std::function<void(const QString &)> toggle;
+    QPersistentModelIndex pressed;
+    bool checkPressed = false;
 };
+
 }
 
 Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
@@ -474,6 +531,14 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     search->hide();
     body->addWidget(search);
 
+    composer = new QWidget(center);
+    auto *composeLayout = new QVBoxLayout(composer);
+    composeLayout->setContentsMargins(1, 0, 1, 0);
+    composer->hide();
+    body->addWidget(composer);
+    parking = new QWidget(center);
+    parking->hide();
+
     model = new QSqlQueryModel(this);
     list = createTaskList(center, model);
     body->addWidget(list, 1);
@@ -518,128 +583,220 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     body->addLayout(footer);
     layout->addWidget(center, 1);
 
-    auto *editorScroll = new QScrollArea(root);
-    editor = editorScroll;
+    editor = new QWidget(parking);
     editor->setObjectName("editor");
-    editor->setFixedWidth(319);
-    editorScroll->setWidgetResizable(true);
-    auto *panel = new QWidget(editor);
-    auto *details = new QVBoxLayout(panel);
-    details->setContentsMargins(14, 9, 14, 14);
-    details->setSpacing(9);
-    auto *editorHeader = new QHBoxLayout;
-    editorHeading = caption({}, panel, "strong");
-    editorHeader->addWidget(editorHeading, 1);
-    auto *closeEditor = button(QStringLiteral("×"), panel, "tool");
-    closeEditor->setAccessibleName(QStringLiteral("Закрыть карточку"));
-    editorHeader->addWidget(closeEditor);
-    details->addLayout(editorHeader);
-    title = new QLineEdit(panel);
+    auto *details = new QVBoxLayout(editor);
+    details->setContentsMargins(11, 8, 11, 9);
+    details->setSpacing(6);
+    auto *header = new QHBoxLayout;
+    completion = button({}, editor, "tool");
+    completion->setFixedSize(30, 30);
+    completion->setIconSize(QSize(18, 18));
+    header->addWidget(completion);
+    title = new QLineEdit(editor);
+    title->setObjectName("inlineTitle");
     title->setPlaceholderText(QStringLiteral("Название задачи"));
-    title->setAccessibleName(QStringLiteral("Название задачи"));
-    details->addWidget(title);
-    notes = new QPlainTextEdit(panel);
+    title->setAccessibleName(title->placeholderText());
+    title->setMinimumWidth(0);
+    header->addWidget(title, 1);
+    pinned = new QCheckBox(QStringLiteral("Закрепить"), editor);
+    header->addWidget(pinned);
+    auto *closeEditor = iconButton(editor, Mark::Close, QStringLiteral("Свернуть карточку"));
+    header->addWidget(closeEditor);
+    details->addLayout(header);
+
+    notes = new QPlainTextEdit(editor);
+    notes->setObjectName("inlineNotes");
     notes->setPlaceholderText(QStringLiteral("Описание"));
-    notes->setAccessibleName(QStringLiteral("Описание"));
-    notes->setFixedHeight(100);
+    notes->setAccessibleName(notes->placeholderText());
+    notes->setFixedHeight(68);
     details->addWidget(notes);
-    auto *form = new QFormLayout;
-    project = new QComboBox(panel);
-    section = new QComboBox(panel);
-    priority = new QComboBox(panel);
-    repeat = new QComboBox(panel);
-    tags = new QLineEdit(panel);
-    tags->setPlaceholderText(QStringLiteral("Через запятую"));
-    due = new QDateEdit(panel);
-    deadline = new QDateEdit(panel);
+
+    auto *actions = new QHBoxLayout;
+    actions->setSpacing(3);
+    dateButton = iconButton(editor, Mark::Calendar, QStringLiteral("Дата"));
+    actions->addWidget(dateButton);
+    actions->addStretch();
+    auto *attachments = iconButton(editor, Mark::Attachment, QStringLiteral("Вложения"));
+    auto *labelButton = iconButton(editor, Mark::Tag, QStringLiteral("Метки"));
+    priorityButton = iconButton(editor, Mark::Flag, QStringLiteral("Приоритет"));
+    reminderButton = iconButton(editor, Mark::Clock, QStringLiteral("Напоминание"));
+    completedDate = iconButton(editor, Mark::History, QStringLiteral("Последнее завершение"));
+    auto *taskMenuButton = iconButton(editor, Mark::More, QStringLiteral("Действия с задачей"));
+    for (auto *tool : {attachments, labelButton, priorityButton, reminderButton, completedDate, taskMenuButton})
+        actions->addWidget(tool);
+    save = button(QStringLiteral("Сохранить"), editor, "primary");
+    actions->addWidget(save);
+    details->addLayout(actions);
+
+    auto *taskMenu = new QMenu(taskMenuButton);
+    templateAction = taskMenu->addAction(QStringLiteral("Использовать как шаблон"));
+    templateAction->setCheckable(true);
+    taskMenu->addSeparator();
+    taskMenu->addAction(QStringLiteral("Скопировать в буфер обмена"), this, [this] {
+        QApplication::clipboard()->setText(current.notes.isEmpty() ? current.title : current.title + "\n" + current.notes);
+    });
+    taskMenu->addAction(QStringLiteral("Дублировать"), this, &Window::duplicateTask);
+    taskMenu->addAction(QStringLiteral("Экспортировать как .ics"), this, [this] {
+        const auto path = QFileDialog::getSaveFileName(this, QStringLiteral("Экспорт задачи"), {},
+            QStringLiteral("Календарь iCalendar (*.ics)"));
+        if (path.isEmpty())
+            return;
+        try {
+            const auto data = CalDav::exportTask(current);
+            QSaveFile file(path.endsWith(".ics", Qt::CaseInsensitive) ? path : path + ".ics");
+            if (data.isEmpty() || !file.open(QIODevice::WriteOnly) || file.write(data) != data.size() || !file.commit())
+                message(QStringLiteral("Не удалось экспортировать задачу"));
+        } catch (const std::exception &error) {
+            message(QString::fromUtf8(error.what()));
+        }
+    });
+    moveAction = taskMenu->addAction(QStringLiteral("Переместить"));
+    auto *deleteAction = taskMenu->addAction(QStringLiteral("Удалить задачу"));
+    taskMenu->addSeparator();
+    auto *historyAction = taskMenu->addAction(QStringLiteral("Журнал задачи"));
+    connect(taskMenuButton, &QPushButton::clicked, this, [taskMenuButton, taskMenu] {
+        taskMenu->popup(taskMenuButton->mapToGlobal(QPoint(0, taskMenuButton->height())));
+    });
+    connect(taskMenu, &QMenu::aboutToShow, this, [this, deleteAction, historyAction] {
+        deleteAction->setEnabled(!current.remote() && !current.id.isEmpty());
+        historyAction->setText(completedDate->toolTip());
+    });
+    historyAction->setEnabled(false);
+
+    cardFields = new QStackedWidget(editor);
+    details->addWidget(cardFields);
+    const auto formPage = [this] {
+        auto *page = new QWidget(cardFields);
+        auto *form = new QFormLayout(page);
+        form->setContentsMargins(2, 2, 2, 2);
+        cardFields->addWidget(page);
+        return form;
+    };
+    auto *dates = formPage();
+    due = new QDateEdit;
+    deadline = new QDateEdit;
     for (auto *date : {due, deadline}) {
         date->setCalendarPopup(true);
         date->setMinimumDate(noDate);
         date->setSpecialValueText(QStringLiteral("Без даты"));
         date->setDisplayFormat(QStringLiteral("dd.MM.yyyy"));
+        auto *row = new QWidget;
+        auto *controls = new QHBoxLayout(row);
+        controls->setContentsMargins(0, 0, 0, 0);
+        controls->addWidget(date, 1);
+        auto *today = button(QStringLiteral("Сегодня"), row, "tool");
+        auto *clear = iconButton(row, Mark::Close, QStringLiteral("Очистить дату"));
+        controls->addWidget(today);
+        controls->addWidget(clear);
+        connect(today, &QPushButton::clicked, date, [date] { date->setDate(QDate::currentDate()); });
+        connect(clear, &QPushButton::clicked, date, [date] { date->setDate(noDate); });
+        dates->addRow(date == due ? QStringLiteral("Дата") : QStringLiteral("Срок"), row);
+        editableFields.append(row);
     }
+    auto *tagForm = formPage();
+    tags = new QLineEdit;
+    tags->setPlaceholderText(QStringLiteral("Через запятую"));
+    tagForm->addRow(QStringLiteral("Метки"), tags);
+    auto *priorities = formPage();
+    priority = new QComboBox;
     priority->addItems({QStringLiteral("Обычный"), QStringLiteral("Высокий"),
                         QStringLiteral("Средний"), QStringLiteral("Низкий")});
+    priorities->addRow(QStringLiteral("Приоритет"), priority);
+    auto *reminders = formPage();
+    auto *reminderRow = new QWidget;
+    auto *reminderLayout = new QHBoxLayout(reminderRow);
+    reminderLayout->setContentsMargins(0, 0, 0, 0);
+    reminder = new QDateTimeEdit;
+    reminder->setCalendarPopup(true);
+    reminder->setMinimumDateTime(noReminder);
+    reminder->setSpecialValueText(QStringLiteral("Без напоминания"));
+    reminder->setDisplayFormat(QStringLiteral("dd.MM.yyyy HH:mm"));
+    reminderLayout->addWidget(reminder, 1);
+    auto *inAnHour = button(QStringLiteral("Через час"), reminderRow, "tool");
+    reminderLayout->addWidget(inAnHour);
+    auto *clearReminder = iconButton(reminderRow, Mark::Close, QStringLiteral("Убрать напоминание"));
+    reminderLayout->addWidget(clearReminder);
+    reminders->addRow(QStringLiteral("Напоминание"), reminderRow);
+    connect(inAnHour, &QPushButton::clicked, this, [this] { reminder->setDateTime(QDateTime::currentDateTime().addSecs(3600)); });
+    connect(clearReminder, &QPushButton::clicked, reminder, [this] { reminder->setDateTime(noReminder); });
+
+    auto *placement = formPage();
+    project = new QComboBox;
+    section = new QComboBox;
+    repeat = new QComboBox;
     repeat->addItem(QStringLiteral("Без повтора"), "");
     repeat->addItem(QStringLiteral("Каждый день"), "daily");
     repeat->addItem(QStringLiteral("Каждую неделю"), "weekly");
     repeat->addItem(QStringLiteral("Каждый месяц"), "monthly");
-    form->addRow(QStringLiteral("Проект"), project);
-    form->addRow(QStringLiteral("Секция"), section);
-    for (auto *date : {due, deadline}) {
-        auto *row = new QWidget(panel);
-        auto *buttons = new QHBoxLayout(row);
-        buttons->setContentsMargins(0, 0, 0, 0);
-        buttons->setSpacing(3);
-        buttons->addWidget(date, 1);
-        auto *today = button(QStringLiteral("◉"), row, "tool");
-        today->setAccessibleName(QStringLiteral("Выбрать сегодня"));
-        today->setToolTip(today->accessibleName());
-        buttons->addWidget(today);
-        auto *clear = button(QStringLiteral("×"), row, "tool");
-        clear->setAccessibleName(QStringLiteral("Очистить дату"));
-        clear->setToolTip(clear->accessibleName());
-        buttons->addWidget(clear);
-        connect(today, &QPushButton::clicked, date, [date] { date->setDate(QDate::currentDate()); });
-        connect(clear, &QPushButton::clicked, date, [date] { date->setDate(noDate); });
-        form->addRow(date == due ? QStringLiteral("Дата") : QStringLiteral("Срок"), row);
-        dateRows.append(row);
-    }
-    form->addRow(QStringLiteral("Приоритет"), priority);
-    form->addRow(QStringLiteral("Повтор"), repeat);
-    form->addRow(QStringLiteral("Метки"), tags);
-    details->addLayout(form);
-    pinned = new QCheckBox(QStringLiteral("Закрепить задачу"), panel);
-    details->addWidget(pinned);
-    auto *subHeader = new QHBoxLayout;
-    subHeader->addWidget(caption(QStringLiteral("Подзадачи"), panel, "strong"), 1);
-    addSubtask = button(QStringLiteral("+"), panel, "tool");
-    addSubtask->setAccessibleName(QStringLiteral("Добавить подзадачу"));
-    subHeader->addWidget(addSubtask);
-    details->addLayout(subHeader);
-    subtasks = new QListWidget(panel);
-    subtasks->setMaximumHeight(130);
-    subtasks->setAccessibleName(QStringLiteral("Подзадачи"));
-    details->addWidget(subtasks);
-    details->addStretch();
-    auto *actions = new QHBoxLayout;
-    remove = button(QStringLiteral("Удалить"), panel, "secondary");
-    save = button(QStringLiteral("Сохранить"), panel, "primary");
-    actions->addWidget(remove);
-    actions->addStretch();
-    actions->addWidget(save);
-    details->addLayout(actions);
-    editorScroll->setWidget(panel);
-    editor->hide();
-    layout->addWidget(editor);
+    placement->addRow(QStringLiteral("Проект"), project);
+    placement->addRow(QStringLiteral("Секция"), section);
+    placement->addRow(QStringLiteral("Повтор"), repeat);
 
-    const auto markDirty = [this] { if (!loading && !current.remote()) dirty = true; };
+    editableFields.append({priority, reminderRow, pinned});
+    for (const auto &entry : {qMakePair(dateButton, dates), qMakePair(labelButton, tagForm),
+                               qMakePair(priorityButton, priorities), qMakePair(reminderButton, reminders)}) {
+        connect(entry.first, &QPushButton::clicked, this, [this, page = entry.second->parentWidget()] {
+            showCardField(page);
+        });
+    }
+    connect(moveAction, &QAction::triggered, this, [this, page = placement->parentWidget()] { showCardField(page); });
+    connect(attachments, &QPushButton::clicked, this, [this, attachments] { showAttachments(attachments); });
+    connect(completedDate, &QPushButton::clicked, this, [this] {
+        QToolTip::showText(completedDate->mapToGlobal(QPoint(0, completedDate->height())),
+                           completedDate->toolTip(), completedDate);
+    });
+
+    addSubtask = button(QStringLiteral("+  Добавить подзадачу"), editor, "tool");
+    details->addWidget(addSubtask, 0, Qt::AlignLeft);
+    subtasks = new QListWidget(editor);
+    subtasks->setObjectName("cardSubtasks");
+    subtasks->setAccessibleName(QStringLiteral("Подзадачи"));
+    subtasks->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    details->addWidget(subtasks);
+    cardFields->hide();
+    editor->hide();
+
+    const auto markDirty = [this] {
+        if (!loading) {
+            dirty = true;
+            updateCardActions();
+        }
+    };
     connect(title, &QLineEdit::textChanged, this, markDirty);
     connect(notes, &QPlainTextEdit::textChanged, this, markDirty);
     connect(tags, &QLineEdit::textChanged, this, markDirty);
     connect(pinned, &QCheckBox::toggled, this, markDirty);
+    connect(templateAction, &QAction::toggled, this, markDirty);
     for (auto *combo : {section, priority, repeat})
         connect(combo, &QComboBox::currentIndexChanged, this, markDirty);
     for (auto *date : {due, deadline})
         connect(date, &QDateEdit::dateChanged, this, markDirty);
+    connect(reminder, &QDateTimeEdit::dateTimeChanged, this, markDirty);
     connect(project, &QComboBox::currentIndexChanged, this, [this, markDirty] {
         if (!loading)
             reloadSections(project->currentData().toString());
         markDirty();
     });
-
-    connect(closeEditor, &QPushButton::clicked, this, [this] {
-        if (mayDiscard())
-            editor->hide();
-    });
+    connect(closeEditor, &QPushButton::clicked, this, [this] { if (mayDiscard()) closeCard(); });
     connect(addTask, &QPushButton::clicked, this, [this] { newTask(); });
     connect(addSubtask, &QPushButton::clicked, this, [this] { newTask(current.id); });
     connect(subtasks, &QListWidget::itemDoubleClicked, this, [this](const QListWidgetItem *item) {
         openTask(item->data(Qt::UserRole).toString());
     });
+    connect(subtasks, &QListWidget::itemChanged, this, [this](const QListWidgetItem *item) {
+        if (loading)
+            return;
+        const auto id = item->data(Qt::UserRole).toString();
+        const QSignalBlocker blocker(subtasks);
+        auto *row = const_cast<QListWidgetItem *>(item);
+        row->setCheckState(item->checkState() == Qt::Checked ? Qt::Unchecked : Qt::Checked);
+        QTimer::singleShot(0, this, [this, id] { toggleTask(id); });
+    });
+    connect(completion, &QPushButton::clicked, this, [this] { toggleTask(current.id); });
     connect(save, &QPushButton::clicked, this, &Window::saveTask);
     connect(title, &QLineEdit::returnPressed, this, &Window::saveTask);
-    connect(remove, &QPushButton::clicked, this, [this] {
+    connect(deleteAction, &QAction::triggered, this, [this] {
         if (current.id.isEmpty() || current.remote())
             return;
         if (QSettings().value("general/confirmDelete", true).toBool()
@@ -647,8 +804,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
             return;
         try {
             store.remove(current.id);
-            dirty = false;
-            editor->hide();
+            closeCard();
             refreshNavigation();
             refresh();
         } catch (const std::exception &error) {
@@ -732,9 +888,27 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     });
     connect(&caldav, &CalDav::progress, this, [this](const QString &text) { status->setText(text); });
     connect(&caldav, &CalDav::failed, this, [this](const QString &error) {
+        writing = false;
+        writingId.clear();
+        updateCardActions();
         syncing = false;
         syncButton->setEnabled(true);
         message(error);
+    });
+    connect(&caldav, &CalDav::updated, this, [this](const Task &previous, const Task &updated) {
+        writing = false;
+        writingId.clear();
+        syncButton->setEnabled(true);
+        try {
+            store.updateRemote(previous, updated);
+            refreshAfterMutation(updated.id);
+            message(updated.done != previous.done
+                ? (updated.done ? QStringLiteral("Задача завершена в Baïkal") : QStringLiteral("Задача снова открыта в Baïkal"))
+                : QStringLiteral("Задача сохранена в Baïkal"));
+        } catch (const std::exception &error) {
+            message(QString::fromUtf8(error.what()));
+        }
+        updateCardActions();
     });
     connect(&caldav, &CalDav::imported, this, [this](const QList<RemoteList> &lists) {
         syncing = false;
@@ -743,10 +917,10 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
             store.importReadOnly(lists);
             refreshNavigation();
             refresh();
-            if (editor->isVisible() && current.remote()) {
+            if (cardOpen && current.remote() && !dirty) {
                 const auto update = store.task(current.id);
                 if (update.id.isEmpty())
-                    editor->hide();
+                    closeCard();
                 else
                     editTask(update);
             }
@@ -778,6 +952,10 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
             setTheme(theme);
     });
 #endif
+    lastReminderCheck = QDateTime::currentDateTimeUtc().addSecs(-60);
+    auto *reminderTimer = new QTimer(this);
+    connect(reminderTimer, &QTimer::timeout, this, &Window::checkReminders);
+    reminderTimer->start(15000);
     loadEvents();
     reloadPreferences();
     const auto home = QSettings().value("general/home", int(Page::Inbox)).toInt();
@@ -832,9 +1010,16 @@ void Window::setTheme(const QString &option)
         QLabel#settingsRowHint { color: %6; font-size: 11px; }
         QLabel#settingsHint { color: %6; }
         QPlainTextEdit#eventList { background: %7; border: 1px solid %4; border-radius: 8px; padding: 4px 7px; }
-        QWidget#sidebar, QScrollArea#editor, QScrollArea#editor > QWidget > QWidget { background: %3; color: %2; }
+        QWidget#sidebar { background: %3; color: %2; }
         QWidget#sidebar { border-right: 1px solid %4; }
-        QScrollArea#editor { border: 0; border-left: 1px solid %4; }
+        QWidget#editor { background: %7; border: 1px solid %4; border-radius: 11px; }
+        QLineEdit#inlineTitle, QPlainTextEdit#inlineNotes, QListWidget#cardSubtasks {
+            background: transparent; border: 0; padding: 2px 4px; }
+        QLineEdit#inlineTitle { font-weight: 600; }
+        QMenu { background: %7; border: 1px solid %4; border-radius: 9px; padding: 5px; }
+        QMenu::item { padding: 7px 18px; border-radius: 5px; }
+        QMenu::item:selected { background: %5; }
+        QMenu::item:disabled { color: %6; }
         QListView#taskList, QListWidget#projects, QScrollArea#board { border: 0; background: transparent; outline: none; }
         QListWidget#projects::item { padding: 6px 5px; border-radius: 5px; }
         QListWidget#projects::item:selected { background: %5; color: %2; }
@@ -851,7 +1036,7 @@ void Window::setTheme(const QString &option)
                              min-width: 50px; max-width: 50px; min-height: 50px; max-height: 50px; }
         QPushButton#addTask:hover, QPushButton#primary:hover { background: #2670b7; }
         QPushButton:disabled { color: %6; }
-        QLineEdit, QPlainTextEdit, QComboBox, QDateEdit { border: 1px solid %4; border-radius: 6px; padding: 5px;
+        QLineEdit, QPlainTextEdit, QComboBox, QDateEdit, QDateTimeEdit { border: 1px solid %4; border-radius: 6px; padding: 5px;
                                                         background: %1; color: %2; }
         QLineEdit:focus, QPlainTextEdit:focus, QPushButton#nav:focus { border: 1px solid #539be6; }
     )CSS").arg(canvas.name(), ink.name(), side.name(), line.name(), colors.color(QPalette::Highlight).name(), muted.name(), card.name());
@@ -926,6 +1111,9 @@ void Window::reloadPreferences()
 
 void Window::selectPage(Page page, const QString &id)
 {
+    if (!mayDiscard())
+        return;
+    closeCard();
     filter = Filter{page, id, {}, {}, {}, {}};
     search->clear();
     search->hide();
@@ -1040,10 +1228,12 @@ void Window::refresh()
 
         pageIcon->setPixmap(markIcon(mark,color).pixmap(20));
         const bool showBoard = board && projectPage;
+        unmountCard();
         auto *scroll = static_cast<QScrollArea *>(boardArea);
         delete scroll->takeWidget();
         qDeleteAll(boardModels);
         boardModels.clear();
+        boardViews.clear();
         if (showBoard) {
             model->clear();
             rebuildBoard();
@@ -1060,7 +1250,8 @@ void Window::refresh()
         emptyHint->setVisible(filter.search.isEmpty());
         const auto action = !quickShortcut->isEnabled() ? QStringLiteral("Ctrl+N") : quickShortcut->key().toString();
         emptyHint->setText(QStringLiteral("Нажмите клавишу «%1», чтобы создать новую задачу").arg(action.toLower()));
-        empty->setVisible(!showBoard && model->rowCount() == 0);
+        empty->setVisible(!showBoard && model->rowCount() == 0 && !cardOpen);
+        mountCard();
     } catch (const std::exception &error) {
         message(QString::fromUtf8(error.what()));
     }
@@ -1076,7 +1267,7 @@ void Window::rebuildBoard()
     sections.prepend({{}, QStringLiteral("Без секции")});
     for (const auto &[id, name] : sections) {
         auto *column = new QWidget(container);
-        column->setMinimumWidth(230);
+        column->setMinimumWidth(380);
         auto *vertical = new QVBoxLayout(column);
         vertical->setContentsMargins(0, 0, 0, 0);
         vertical->addWidget(caption(name, column, "strong"));
@@ -1085,7 +1276,9 @@ void Window::rebuildBoard()
         auto *columnModel = new QSqlQueryModel(this);
         boardModels.append(columnModel);
         columnModel->setQuery(store.query(columnFilter));
-        vertical->addWidget(createTaskList(column, columnModel), 1);
+        auto *view = createTaskList(column, columnModel);
+        boardViews.append(view);
+        vertical->addWidget(view, 1);
         columns->addWidget(column, 1);
     }
     scroll->setWidgetResizable(true);
@@ -1094,39 +1287,36 @@ void Window::rebuildBoard()
 
 QListView *Window::createTaskList(QWidget *parent, QSqlQueryModel *taskModel)
 {
-    auto *view = new QListView(parent);
+    const auto completeTask = [this](const QString &id) {
+        QTimer::singleShot(0, this, [this, id] { toggleTask(id); });
+    };
+    auto *view = new TaskView(completeTask, parent);
     view->setObjectName("taskList");
     view->setAccessibleName(QStringLiteral("Задачи"));
     view->setModel(taskModel);
-    view->setUniformItemSizes(true);
+    view->setUniformItemSizes(false);
     view->setMouseTracking(true);
     view->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     view->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    view->setItemDelegate(new TaskDelegate([this](const QString &id) { toggleTask(id); }, view));
-    connect(view, &QListView::clicked, this, [this](const QModelIndex &idx) {
-        const auto *mouse = qobject_cast<QListView *>(sender());
-        if (mouse && mouse->indexAt(mouse->viewport()->mapFromGlobal(QCursor::pos())) == idx) {
-            const bool child = !idx.siblingAtColumn(6).data().toString().isEmpty();
-            const auto point = mouse->viewport()->mapFromGlobal(QCursor::pos());
-            const auto row = mouse->visualRect(idx);
-            if (QRect(row.left() + (child ? 23 : 8), row.top() + 14, 26, 26).contains(point))
-                return;
-        }
-        openTask(idx.data().toString());
-    });
-    connect(view, &QListView::activated, this, [this](const QModelIndex &idx) { openTask(idx.data().toString()); });
+    view->setItemDelegate(new TaskDelegate(view));
+    const auto activate = [this](const QModelIndex &idx) {
+        const auto id = idx.data().toString();
+        QTimer::singleShot(0, this, [this, id] { openTask(id); });
+    };
+    connect(view, &QListView::clicked, this, activate);
+    connect(view, &QListView::activated, this, activate);
     auto *complete = new QShortcut(QKeySequence(Qt::Key_Space), view);
     complete->setContext(Qt::WidgetShortcut);
-    connect(complete, &QShortcut::activated, this, [this, view] {
-        toggleTask(view->currentIndex().data().toString());
+    connect(complete, &QShortcut::activated, this, [completeTask, view] {
+        completeTask(view->currentIndex().data().toString());
     });
     return view;
 }
 
 void Window::openTask(const QString &id)
 {
-    if (editor->isVisible() && current.id == id)
+    if (cardOpen && current.id == id)
         return;
     if (!mayDiscard())
         return;
@@ -1141,17 +1331,19 @@ void Window::openTask(const QString &id)
 
 void Window::editTask(const Task &task)
 {
+    unmountCard();
     loading = true;
     dirty = false;
     current = task;
-    const bool writable = !task.remote();
-    editorHeading->setText(!writable ? QStringLiteral("Задача Baïkal") :
-                           task.id.isEmpty() ? QStringLiteral("Новая задача") : QStringLiteral("Задача"));
+    if (current.remote() && current.attachments.isEmpty() && !current.reminder.isValid())
+        CalDav::populateDetails(current);
+    const bool editable = task.repeat != "remote";
     title->setText(task.title);
     notes->setPlainText(task.notes);
     tags->setText(task.tags);
     due->setDate(task.due.isValid() ? task.due : noDate);
     deadline->setDate(task.deadline.isValid() ? task.deadline : noDate);
+    reminder->setDateTime(current.reminder.isValid() ? current.reminder.toLocalTime() : noReminder);
     priority->setCurrentIndex(qBound(0, task.priority, 3));
     if (repeat->findData("remote") >= 0)
         repeat->removeItem(repeat->findData("remote"));
@@ -1159,6 +1351,7 @@ void Window::editTask(const Task &task)
         repeat->addItem(QStringLiteral("Повтор Baïkal"), "remote");
     selectData(repeat, task.repeat);
     pinned->setChecked(task.pinned);
+    templateAction->setChecked(current.taskTemplate);
     project->clear();
     project->addItem(QStringLiteral("Входящие"), Store::inbox());
     for (const auto &p : store.projects())
@@ -1166,20 +1359,122 @@ void Window::editTask(const Task &task)
             project->addItem(p.title, p.id);
     selectData(project, task.project);
     reloadSections(task.project, task.section);
-    title->setReadOnly(!writable);
-    notes->setReadOnly(!writable);
-    tags->setReadOnly(!writable);
-    project->setEnabled(writable && task.parent.isEmpty());
-    for (QWidget *field : QList<QWidget *>{section, priority, repeat, pinned} + dateRows)
-        field->setEnabled(writable);
-    save->setVisible(writable);
-    remove->setVisible(writable && !task.id.isEmpty());
-    addSubtask->setVisible(writable && !task.id.isEmpty());
+    project->setEnabled(!task.remote() && task.parent.isEmpty());
+    section->setEnabled(!task.remote());
+    repeat->setEnabled(!task.remote());
+    title->setReadOnly(!editable);
+    notes->setReadOnly(!editable);
+    tags->setReadOnly(!editable);
+    for (auto *field : editableFields)
+        field->setEnabled(editable);
+    completion->setVisible(!task.id.isEmpty());
+    templateAction->setEnabled(editable);
+    moveAction->setEnabled(!task.remote());
+    addSubtask->setVisible(!task.remote() && !task.id.isEmpty());
+    cardFields->hide();
     reloadSubtasks();
     loading = false;
+    cardOpen = true;
+    updateCardActions();
+    mountCard();
+    if (expandedView)
+        expandedView->scrollTo(expandedIndex, QAbstractItemView::EnsureVisible);
+}
+
+void Window::unmountCard()
+{
+    editor->hide();
+    editor->setParent(parking);
+    composer->hide();
+    if (expandedView && expandedIndex.isValid()) {
+        auto *delegate = static_cast<TaskDelegate *>(expandedView->itemDelegate());
+        delegate->expandedId.clear();
+        expandedView->setIndexWidget(expandedIndex, nullptr);
+        expandedView->doItemsLayout();
+    }
+    expandedView = nullptr;
+    expandedIndex = QPersistentModelIndex();
+}
+
+void Window::mountCard()
+{
+    if (!cardOpen)
+        return;
+    if (!current.id.isEmpty()) {
+        const auto views = boardArea->isVisible() ? boardViews : QList<QListView *>{list};
+        for (auto *view : views) {
+            auto *tasks = view->model();
+            for (int row = 0; row < tasks->rowCount(); ++row) {
+                const auto index = tasks->index(row, 0);
+                if (index.data().toString() != current.id)
+                    continue;
+                auto *rowWidget = new QWidget(view);
+                auto *rowLayout = new QVBoxLayout(rowWidget);
+                rowLayout->setContentsMargins(1, 1, 1, 2);
+                rowLayout->addWidget(editor);
+                expandedView = view;
+                expandedIndex = index;
+                auto *delegate = static_cast<TaskDelegate *>(view->itemDelegate());
+                delegate->expandedId = current.id;
+                view->setIndexWidget(index, rowWidget);
+                editor->show();
+                resizeCard();
+                return;
+            }
+        }
+    }
+    composer->layout()->addWidget(editor);
+    empty->hide();
+    composer->show();
     editor->show();
 }
 
+void Window::closeCard()
+{
+    unmountCard();
+    cardOpen = false;
+    dirty = false;
+    current = {};
+    empty->setVisible(!boardArea->isVisible() && model->rowCount() == 0);
+}
+
+void Window::resizeCard()
+{
+    if (expandedView && expandedIndex.isValid()) {
+        editor->layout()->invalidate();
+        auto *delegate = static_cast<TaskDelegate *>(expandedView->itemDelegate());
+        delegate->expandedHeight = editor->sizeHint().height() + 4;
+        expandedView->doItemsLayout();
+    }
+}
+
+void Window::showCardField(QWidget *field)
+{
+    const bool open = cardFields->isHidden() || cardFields->currentWidget() != field;
+    cardFields->setCurrentWidget(field);
+    cardFields->setVisible(open);
+    resizeCard();
+}
+
+void Window::updateCardActions()
+{
+    const auto ink = palette().color(QPalette::WindowText);
+    const auto checked = current.done ? QStringLiteral("Вернуть в активные") : QStringLiteral("Завершить задачу");
+    completion->setIcon(markIcon(current.done ? Mark::Complete : Mark::Circle, ink));
+    completion->setAccessibleName(checked);
+    completion->setToolTip(checked);
+    editor->setEnabled(!writing || current.id != writingId);
+    save->setVisible(current.repeat != "remote");
+    save->setEnabled(!writing && (dirty || current.id.isEmpty()));
+    dateButton->setToolTip(due->date() == noDate ? QStringLiteral("Дата") :
+        QStringLiteral("Дата · %1").arg(QLocale().toString(due->date(), QLocale::ShortFormat)));
+    priorityButton->setToolTip(QStringLiteral("Приоритет · %1").arg(priority->currentText()));
+    reminderButton->setToolTip(reminder->dateTime().date() == noDate ? QStringLiteral("Напоминание") :
+        QStringLiteral("Напоминание · %1").arg(QLocale().toString(reminder->dateTime(), QLocale::ShortFormat)));
+    completedDate->setToolTip(current.completed.isValid()
+        ? QStringLiteral("Последнее завершение · %1").arg(QLocale().toString(current.completed.toLocalTime(), QLocale::ShortFormat))
+        : QStringLiteral("Задача ещё не завершалась"));
+}
 void Window::newTask(const QString &parent)
 {
     if (!mayDiscard())
@@ -1211,26 +1506,31 @@ void Window::reloadSections(const QString &projectId, const QString &selected)
 
 void Window::reloadSubtasks()
 {
+    const QSignalBlocker blocker(subtasks);
     subtasks->clear();
-    if (current.id.isEmpty())
-        return;
-    Filter children;
-    children.parent = current.id;
-    auto query = store.query(children);
-    while (query.next()) {
-        auto *item = new QListWidgetItem((query.value(2).toBool() ? QStringLiteral("✓  ")
-                                                                 : QStringLiteral("◯  ")) + query.value(1).toString(), subtasks);
-        item->setData(Qt::UserRole, query.value(0));
+    if (!current.id.isEmpty()) {
+        Filter children;
+        children.parent = current.id;
+        auto query = store.query(children);
+        while (query.next()) {
+            auto *item = new QListWidgetItem(query.value(1).toString(), subtasks);
+            item->setData(Qt::UserRole, query.value(0));
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setCheckState(query.value(2).toBool() ? Qt::Checked : Qt::Unchecked);
+        }
     }
+    subtasks->setVisible(subtasks->count() > 0);
+    subtasks->setFixedHeight(qMin(4, subtasks->count()) * 26 + 4);
+    resizeCard();
 }
 
 void Window::saveTask()
 {
-    if (current.remote())
+    if (writing || !cardOpen || current.repeat == "remote")
         return;
     try {
         auto draft = current;
-        draft.title = title->text();
+        draft.title = title->text().trimmed();
         draft.notes = notes->toPlainText();
         draft.tags = tags->text();
         draft.project = project->currentData().toString();
@@ -1240,11 +1540,17 @@ void Window::saveTask()
         draft.priority = priority->currentIndex();
         draft.repeat = repeat->currentData().toString();
         draft.pinned = pinned->isChecked();
-        current = store.task(store.saveTask(draft));
-        dirty = false;
-        refreshNavigation();
-        refresh();
-        editTask(current);
+        draft.reminder = reminder->dateTime().date() == noDate ? QDateTime() : reminder->dateTime().toUTC();
+        draft.taskTemplate = templateAction->isChecked();
+        if (draft.remote()) {
+            auto before = current;
+            CalDav::populateDetails(before);
+            writeRemote(before, draft);
+            return;
+        }
+        const auto id = store.saveTask(draft);
+        current.id = id;
+        refreshAfterMutation(id);
         message(QStringLiteral("Задача сохранена"));
     } catch (const std::exception &error) {
         message(QString::fromUtf8(error.what()));
@@ -1253,29 +1559,175 @@ void Window::saveTask()
 
 void Window::toggleTask(const QString &id)
 {
-    if (id.isEmpty())
-        return;
-    if (dirty && current.id == id && !mayDiscard())
+    if (id.isEmpty() || writing || (dirty && current.id == id && !mayDiscard()))
         return;
     try {
-        if (store.task(id).remote()) {
-            message(QStringLiteral("Задачи Baïkal доступны для просмотра"));
+        auto task = store.task(id);
+        if (task.remote()) {
+            if (task.repeat == "remote") {
+                message(QStringLiteral("Повторяющуюся задачу Baïkal измените в исходном клиенте"));
+                return;
+            }
+            CalDav::populateDetails(task);
+            auto draft = task;
+            draft.done = !task.done;
+            writeRemote(task, draft);
             return;
         }
         store.toggle(id);
-        refreshCounts();
-        refresh();
-        if (editor->isVisible() && current.id == id)
-            editTask(store.task(id));
-        else if (editor->isVisible())
-            reloadSubtasks();
+        refreshAfterMutation(id);
     } catch (const std::exception &error) {
         message(QString::fromUtf8(error.what()));
     }
 }
 
+bool Window::writeRemote(const Task &previous, const Task &draft)
+{
+    if (syncing || writing) {
+        message(QStringLiteral("Дождитесь завершения обмена с Baïkal"));
+        return false;
+    }
+    const auto cached = store.task(previous.id);
+    if (cached.etag != previous.etag || !cached.remote()) {
+        message(QStringLiteral("Задача обновилась. Откройте карточку заново перед сохранением"));
+        return false;
+    }
+    const auto owner = store.project(previous.project);
+    if (!caldav.connected(owner) && !authorize(owner))
+        return false;
+    if (!caldav.update(owner, previous, draft))
+        return false;
+    writing = true;
+    writingId = previous.id;
+    syncButton->setEnabled(false);
+    updateCardActions();
+    message(QStringLiteral("Сохранение в Baïkal…"));
+    return true;
+}
+
+void Window::refreshAfterMutation(const QString &id)
+{
+    if (cardOpen && current.id == id) {
+        const auto updated = store.task(id);
+        dirty = false;
+        unmountCard();
+        cardOpen = false;
+        refreshNavigation();
+        refresh();
+        const auto views = boardArea->isVisible() ? boardViews : QList<QListView *>{list};
+        for (auto *view : views) {
+            auto *tasks = view->model();
+            for (int row = 0; row < tasks->rowCount(); ++row) {
+                if (tasks->index(row, 0).data().toString() == id) {
+                    editTask(updated);
+                    return;
+                }
+            }
+        }
+        current = {};
+    } else {
+        refreshNavigation();
+        refresh();
+        if (cardOpen)
+            reloadSubtasks();
+    }
+}
+
+void Window::showAttachments(QWidget *anchor)
+{
+    auto *menu = new QMenu(anchor);
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    for (const auto &link : current.attachments) {
+        const QUrl url(link, QUrl::StrictMode);
+        const bool web = url.isValid() && (url.scheme() == "https" || url.scheme() == "http");
+        const bool local = !current.remote() && url.isLocalFile();
+        auto *item = menu->addAction(QFontMetrics(font()).elidedText(link, Qt::ElideMiddle, 370), this,
+                                    [url] { QDesktopServices::openUrl(url); });
+        item->setEnabled(web || local);
+    }
+    if (!current.attachments.isEmpty())
+        menu->addSeparator();
+    if (current.repeat != "remote") {
+        menu->addAction(QStringLiteral("Добавить ссылку"), this, [this] {
+            bool ok = false;
+            const auto value = QInputDialog::getText(this, QStringLiteral("Добавить ссылку"),
+                QStringLiteral("URL вложения"), QLineEdit::Normal, {}, &ok);
+            if (!ok)
+                return;
+            const QUrl url(value.trimmed(), QUrl::StrictMode);
+            if (!url.isValid() || url.host().isEmpty() || !url.userInfo().isEmpty() ||
+                (url.scheme() != "https" && url.scheme() != "http")) {
+                message(QStringLiteral("Введите ссылку HTTP или HTTPS без логина и пароля"));
+                return;
+            }
+            const auto link = QString::fromLatin1(url.toEncoded());
+            if (!current.attachments.contains(link)) {
+                current.attachments.append(link);
+                dirty = true;
+                updateCardActions();
+            }
+        });
+        if (!current.remote()) {
+            menu->addAction(QStringLiteral("Добавить локальный файл"), this, [this] {
+                const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("Добавить файл"));
+                if (path.isEmpty())
+                    return;
+                const auto link = QString::fromLatin1(QUrl::fromLocalFile(path).toEncoded());
+                if (!current.attachments.contains(link)) {
+                    current.attachments.append(link);
+                    dirty = true;
+                    updateCardActions();
+                }
+            });
+        }
+    }
+    if (menu->isEmpty())
+        menu->addAction(QStringLiteral("Нет вложений"))->setEnabled(false);
+    menu->popup(anchor->mapToGlobal(QPoint(0, anchor->height())));
+}
+
+void Window::duplicateTask()
+{
+    if (current.id.isEmpty() || !mayDiscard())
+        return;
+    auto copy = store.task(current.id);
+    CalDav::populateDetails(copy);
+    if (copy.remote()) {
+        copy = Task{.project = Store::inbox(), .title = copy.title, .notes = copy.notes,
+            .tags = copy.tags, .due = copy.due, .deadline = copy.deadline, .priority = copy.priority,
+            .attachments = copy.attachments, .reminder = copy.reminder};
+    }
+    copy.id.clear();
+    copy.done = false;
+    copy.completed = {};
+    copy.taskTemplate = false;
+    editTask(copy);
+    title->selectAll();
+    title->setFocus();
+}
+
+void Window::checkReminders()
+{
+    const auto now = QDateTime::currentDateTimeUtc();
+    try {
+        const auto dueReminders = store.reminders(lastReminderCheck, now);
+        lastReminderCheck = now;
+        for (const auto &entry : dueReminders) {
+            auto *notice = new QMessageBox(QMessageBox::Information, QStringLiteral("Напоминание о задаче"),
+                                            QString(), QMessageBox::Ok, this);
+            notice->setTextFormat(Qt::PlainText);
+            notice->setText(entry.second);
+            notice->setAttribute(Qt::WA_DeleteOnClose);
+            notice->show();
+        }
+    } catch (const std::exception &error) {
+        message(QString::fromUtf8(error.what()));
+    }
+}
 bool Window::mayDiscard()
 {
+    if (writing && cardOpen && current.id == writingId)
+        return false;
     if (!dirty)
         return true;
     const auto answer = QMessageBox::question(this, QStringLiteral("Сохранить изменения?"),
@@ -1306,41 +1758,56 @@ void Window::closeEvent(QCloseEvent *event)
 
 void Window::showSync()
 {
-    if (syncing)
+    if (syncing || writing)
         return;
+    authorize({}, true);
+}
+
+bool Window::authorize(const Project &owner, bool refreshLists)
+{
     QDialog dialog(this);
-    dialog.setWindowTitle(QStringLiteral("Импорт задач из Baïkal"));
+    dialog.setWindowTitle(refreshLists ? QStringLiteral("Baïkal") : QStringLiteral("Подключение к Baïkal"));
     auto *layout = new QFormLayout(&dialog);
-    auto *help = new QLabel(QStringLiteral("Приложение скачает списки и задачи для просмотра."), &dialog);
+    auto *help = new QLabel(refreshLists
+        ? QStringLiteral("Загрузить списки и задачи. Пароль действует до закрытия приложения.")
+        : QStringLiteral("Для записи в Baïkal введите пароль учётной записи. Он действует до закрытия приложения."), &dialog);
     help->setWordWrap(true);
     layout->addRow(help);
-    auto *address = new QLineEdit(QSettings().value("dav/address").toString(), &dialog);
+    const QSettings settings;
+    auto *address = new QLineEdit(settings.value("dav/address").toString(), &dialog);
     address->setPlaceholderText(QStringLiteral("https://…/dav.php"));
-    auto *login = new QLineEdit(QSettings().value("dav/user").toString(), &dialog);
+    auto *login = new QLineEdit(settings.value("dav/user").toString(), &dialog);
     auto *passwordInput = new QLineEdit(&dialog);
     passwordInput->setEchoMode(QLineEdit::Password);
     layout->addRow(QStringLiteral("Адрес"), address);
     layout->addRow(QStringLiteral("Логин"), login);
     layout->addRow(QStringLiteral("Пароль"), passwordInput);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Загрузить"));
+    buttons->button(QDialogButtonBox::Ok)->setText(refreshLists ? QStringLiteral("Обновить") : QStringLiteral("Подключить"));
     layout->addRow(buttons);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    dialog.setMinimumWidth(390);
+    dialog.setMinimumWidth(380);
+    passwordInput->setFocus();
     if (dialog.exec() != QDialog::Accepted)
-        return;
+        return false;
     const auto url = QUrl(address->text().trimmed(), QUrl::StrictMode);
     const auto user = login->text().trimmed();
     const auto password = passwordInput->text();
     passwordInput->clear();
-    syncing = caldav.start(url, user, password);
-    syncButton->setEnabled(!syncing);
-    if (syncing) {
-        QSettings settings;
-        settings.setValue("dav/address", url.toString());
-        settings.setValue("dav/user", user);
+    if (refreshLists) {
+        syncing = caldav.start(url, user, password);
+        syncButton->setEnabled(!syncing);
+        if (!syncing)
+            return false;
+    } else if (!caldav.connectAccount(url, user, password) || !caldav.connected(owner)) {
+        message(QStringLiteral("Адрес и логин должны соответствовать списку Baïkal"));
+        return false;
     }
+    QSettings saved;
+    saved.setValue("dav/address", url.toString());
+    saved.setValue("dav/user", user);
+    return true;
 }
 
 void Window::message(const QString &text)
@@ -1359,9 +1826,32 @@ bool Window::smokeTest()
     if (current.id.isEmpty() || model->rowCount() != 1)
         return false;
     const auto id = current.id;
-    toggleTask(id);
+    closeCard();
+    const auto clickRow = [this](const QPoint &point) {
+        auto *target = list->viewport();
+        const auto global = target->mapToGlobal(point);
+        QMouseEvent press(QEvent::MouseButtonPress, point, global, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QMouseEvent release(QEvent::MouseButtonRelease, point, global, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(target, &press);
+        QApplication::sendEvent(target, &release);
+        QApplication::processEvents();
+    };
+    list->doItemsLayout();
+    const auto index = model->index(0, 0);
+    const auto rect = list->visualRect(index);
+    clickRow(QPoint(rect.left() + 80, rect.center().y()));
+    if (expandedView != list || current.id != id || list->visualRect(index).height() <= rect.height()
+        || !list->viewport()->isAncestorOf(editor))
+        return false;
+    dateButton->click();
+    if (!cardFields->isVisible() || list->visualRect(index).height() <= rect.height() + 80)
+        return false;
+    closeCard();
+    clickRow(completionHit(list->visualRect(index)).center());
+    if (cardOpen || !store.task(id).done)
+        return false;
     selectPage(Page::Completed);
-    if (model->rowCount() != 1 || !store.task(id).done)
+    if (model->rowCount() != 1 || !store.task(id).completed.isValid())
         return false;
     const auto sample = store.addProject(QStringLiteral("Проект"));
     store.addSection(sample, QStringLiteral("Испытание доски"));

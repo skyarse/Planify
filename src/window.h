@@ -5,14 +5,19 @@
 
 #include <QMainWindow>
 #include <QMap>
+#include <QPersistentModelIndex>
+#include <QPointer>
 #include <optional>
 
+class QAction;
 class QCheckBox;
 class QCloseEvent;
 class QDialog;
 class QShortcut;
 class QComboBox;
 class QDateEdit;
+class QDateTimeEdit;
+class QStackedWidget;
 class QLabel;
 class QLineEdit;
 class QListView;
@@ -61,9 +66,27 @@ private:
     QListView *list;
     QWidget *boardArea;
     QWidget *editor;
-    QLabel *editorHeading;
+    QStackedWidget *cardFields;
+    QPushButton *completion;
+    QPushButton *completedDate;
+    QPushButton *dateButton;
+    QPushButton *priorityButton;
+    QPushButton *reminderButton;
+    QDateTimeEdit *reminder;
+    QAction *templateAction;
+    QAction *moveAction;
+    QList<QWidget *> editableFields;
+    QDateTime lastReminderCheck;
     QSqlQueryModel *model;
     QList<QSqlQueryModel *> boardModels;
+    QList<QListView *> boardViews;
+    QWidget *composer;
+    QWidget *parking;
+    QPointer<QListView> expandedView;
+    QPersistentModelIndex expandedIndex;
+    bool cardOpen = false;
+    bool writing = false;
+    QString writingId;
     QPushButton *syncButton;
     QPushButton *boardButton;
     QPushButton *addSection;
@@ -77,12 +100,10 @@ private:
     QLineEdit *tags;
     QDateEdit *due;
     QDateEdit *deadline;
-    QList<QWidget *> dateRows;
     QCheckBox *pinned;
     QListWidget *subtasks;
     QPushButton *addSubtask;
     QPushButton *save;
-    QPushButton *remove;
 
     void setTheme(const QString &option);
     void selectPage(Page page, const QString &id = {});
@@ -102,6 +123,18 @@ private:
     void reloadSections(const QString &projectId, const QString &selected = {});
     void reloadSubtasks();
     void saveTask();
+    void mountCard();
+    void unmountCard();
+    void closeCard();
+    void resizeCard();
+    void updateCardActions();
+    void showCardField(QWidget *field);
+    void showAttachments(QWidget *anchor);
+    void duplicateTask();
+    bool authorize(const Project &owner, bool refreshLists = false);
+    bool writeRemote(const Task &before, const Task &draft);
+    void refreshAfterMutation(const QString &id);
+    void checkReminders();
     void toggleTask(const QString &id);
     bool mayDiscard();
     void showSync();

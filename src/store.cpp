@@ -3,6 +3,8 @@
 #include <QSet>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QSaveFile>
 #include <QTemporaryDir>
 #include <QSqlError>
@@ -68,9 +70,9 @@ Store::Store(const QString &path) : connection(newId()), db(QSqlDatabase::addDat
             throw std::runtime_error("Не удалось определить версию базы");
         const int current = version.value(0).toInt();
         version.finish();
-        if (current > 1)
+        if (current > 2)
             throw std::runtime_error("Эта база создана более новой версией приложения");
-        if (current == 1)
+        if (current == 2)
             return;
         failUnless(db.transaction(), db.lastError());
         execute(R"SQL(
@@ -98,7 +100,11 @@ Store::Store(const QString &path) : connection(newId()), db(QSqlDatabase::addDat
         execute("CREATE INDEX IF NOT EXISTS tasks_done_due ON tasks(done, due)");
         execute("CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent)");
         execute("INSERT OR IGNORE INTO projects(id,title) VALUES('inbox','Входящие')");
-        execute("PRAGMA user_version=1");
+        execute("ALTER TABLE tasks ADD COLUMN completed TEXT NOT NULL DEFAULT ''");
+        execute("ALTER TABLE tasks ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'");
+        execute("ALTER TABLE tasks ADD COLUMN reminder TEXT NOT NULL DEFAULT ''");
+        execute("ALTER TABLE tasks ADD COLUMN task_template INTEGER NOT NULL DEFAULT 0");
+        execute("PRAGMA user_version=2");
         failUnless(db.commit(), db.lastError());
     } catch (...) {
         db.close();
@@ -186,6 +192,11 @@ Task Store::task(const QString &id) const
     t.calendarData = q.value(15).toByteArray();
     t.remoteUid = q.value(16).toString();
     t.remoteParentUid = q.value(17).toString();
+    t.completed = QDateTime::fromString(q.value(21).toString(), Qt::ISODate);
+    for (const auto &link : QJsonDocument::fromJson(q.value(22).toByteArray()).array())
+        t.attachments.append(link.toString());
+    t.reminder = QDateTime::fromString(q.value(23).toString(), Qt::ISODate);
+    t.taskTemplate = q.value(24).toBool();
     return t;
 }
 
@@ -236,19 +247,28 @@ void Store::writeTask(const Task &t)
 {
     QSqlQuery q(db);
     q.prepare(R"SQL(
-        INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
           project=excluded.project, section=excluded.section, parent=excluded.parent,
           title=excluded.title, notes=excluded.notes, tags=excluded.tags, due=excluded.due,
           deadline=excluded.deadline, priority=excluded.priority, done=excluded.done,
           pinned=excluded.pinned, repeat=excluded.repeat, href=excluded.href,
           etag=excluded.etag, ical=excluded.ical, remote_uid=excluded.remote_uid,
-          remote_parent_uid=excluded.remote_parent_uid
+          remote_parent_uid=excluded.remote_parent_uid,
+          title_norm=excluded.title_norm, notes_norm=excluded.notes_norm, tags_norm=excluded.tags_norm,
+          completed=CASE
+            WHEN excluded.href<>'' AND excluded.completed='' THEN tasks.completed
+            ELSE excluded.completed END,
+          attachments=excluded.attachments,
+          reminder=excluded.reminder, task_template=excluded.task_template
     )SQL");
     const QVariantList fields = {t.id, t.project, t.section, t.parent, t.title, t.notes, t.tags,
         iso(t.due), iso(t.deadline), t.priority, t.done, t.pinned, t.repeat, t.href, t.etag,
         t.calendarData.isNull() ? QByteArray("") : t.calendarData, t.remoteUid, t.remoteParentUid,
-        t.title.toCaseFolded(), t.notes.toCaseFolded(), t.tags.toCaseFolded()};
+        t.title.toCaseFolded(), t.notes.toCaseFolded(), t.tags.toCaseFolded(),
+        t.completed.toUTC().toString(Qt::ISODate),
+        QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(t.attachments)).toJson(QJsonDocument::Compact)),
+        t.reminder.toUTC().toString(Qt::ISODate), t.taskTemplate};
     for (const auto &value : fields)
         q.addBindValue(value.metaType().id() == QMetaType::QString && value.toString().isNull() ? QVariant(QStringLiteral("")) : value);
     run(q);
@@ -294,6 +314,8 @@ void Store::toggle(const QString &id)
     auto t = task(id);
     if (t.id.isEmpty())
         return;
+    if (!t.done)
+        t.completed = QDateTime::currentDateTimeUtc();
     if (!t.done && t.due.isValid() && !t.repeat.isEmpty()) {
         if (t.repeat == "daily")
             t.due = t.due.addDays(1);
@@ -307,6 +329,33 @@ void Store::toggle(const QString &id)
         t.done = !t.done;
     }
     saveTask(t);
+}
+
+void Store::updateRemote(const Task &previous, Task updated)
+{
+    const auto cached = task(previous.id);
+    if (!cached.remote() || cached.href != previous.href || cached.etag != previous.etag ||
+        updated.id != cached.id || updated.project != cached.project || updated.href != cached.href ||
+        updated.remoteUid != cached.remoteUid || updated.remoteParentUid != cached.remoteParentUid)
+        throw std::runtime_error("Локальная копия изменилась. Обновите задачи Baïkal");
+    if (!updated.completed.isValid())
+        updated.completed = cached.completed;
+    updated.parent = cached.parent;
+    updated.section = cached.section;
+    writeTask(updated);
+}
+
+QList<QPair<QString, QString>> Store::reminders(const QDateTime &from, const QDateTime &through) const
+{
+    QSqlQuery q(db);
+    q.prepare("SELECT id,title FROM tasks WHERE done=0 AND reminder>? AND reminder<=? ORDER BY reminder");
+    q.addBindValue(from.toUTC().toString(Qt::ISODate));
+    q.addBindValue(through.toUTC().toString(Qt::ISODate));
+    run(q);
+    QList<QPair<QString, QString>> result;
+    while (q.next())
+        result.append({q.value(0).toString(), q.value(1).toString()});
+    return result;
 }
 
 void Store::remove(const QString &id)
@@ -530,11 +579,12 @@ void Store::importBackup(const QString &path)
     attach.finish();
 
     try {
+        int version = 0;
         {
             QSqlQuery check(db);
             bool ok = check.exec("PRAGMA snapshot.user_version");
             failUnless(ok, check.lastError());
-            if (!check.next() || check.value(0).toInt()!=1)
+            if (!check.next() || ((version = check.value(0).toInt()) != 1 && version != 2))
                 throw std::runtime_error("Формат резервной копии не поддерживается");
             ok = check.exec("PRAGMA snapshot.quick_check");
             failUnless(ok, check.lastError());
@@ -542,11 +592,13 @@ void Store::importBackup(const QString &path)
                 throw std::runtime_error("Файл резервной копии повреждён");
             check.finish();
         }
-        const QList<QPair<QString,QString>> tables{
+        QList<QPair<QString, QString>> tables{
             {"projects","id,title,account,href"},
             {"sections","id,project,title"},
             {"tasks","id,project,section,parent,title,notes,tags,due,deadline,priority,done,pinned,repeat,href,etag,ical,remote_uid,remote_parent_uid,title_norm,notes_norm,tags_norm"},
         };
+        if (version == 2)
+            tables.last().second += ",completed,attachments,reminder,task_template";
         failUnless(db.transaction(), db.lastError());
         for (const auto &[name,columns] : tables) {
             QSqlQuery type(db);

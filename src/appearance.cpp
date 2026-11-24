@@ -125,6 +125,34 @@ void drawMark(QPainter &p, Mark mark, const QRectF &rect, QColor color, qreal st
         path({{4,4},{4,9},{9,9}});
         path({{20,20},{20,15},{15,15}});
         break;
+    case Mark::Circle:
+        p.drawEllipse(QRectF(3, 3, 18, 18));
+        break;
+    case Mark::Attachment: {
+        QPainterPath clip({7, 11});
+        clip.lineTo(7, 17);
+        clip.cubicTo(7, 23, 17, 23, 17, 17);
+        clip.lineTo(17, 7);
+        clip.cubicTo(17, 2, 10, 2, 10, 7);
+        clip.lineTo(10, 16);
+        clip.cubicTo(10, 19, 14, 19, 14, 16);
+        clip.lineTo(14, 8);
+        p.drawPath(clip);
+        break;
+    }
+    case Mark::Flag:
+        p.drawLine(5, 4, 5, 21);
+        path({{5, 5}, {11, 5}, {14, 8}, {20, 8}, {20, 15}, {14, 15}, {11, 12}, {5, 12}});
+        break;
+    case Mark::Clock:
+        p.drawEllipse(QRectF(3, 3, 18, 18));
+        path({{12, 7}, {12, 12}, {16, 14}});
+        break;
+    case Mark::History:
+        p.drawArc(QRectF(4, 4, 16, 16), 0, 285 * 16);
+        path({{3, 21}, {3, 15}, {9, 15}});
+        path({{12, 7}, {12, 12}, {15, 14}});
+        break;
     case Mark::Project:
         p.drawEllipse(QRectF(4,4,16,16));
         p.drawEllipse(QRectF(8,8,8,8));

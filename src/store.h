@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QDate>
+#include <QDateTime>
+#include <QStringList>
 #include <QHash>
 #include <QList>
 #include <QUrl>
@@ -35,6 +37,10 @@ struct Task {
     QByteArray calendarData;
     QString remoteUid;
     QString remoteParentUid;
+    QDateTime completed;
+    QStringList attachments;
+    QDateTime reminder;
+    bool taskTemplate = false;
     bool remote() const { return !href.isEmpty(); }
 };
 
@@ -80,6 +86,8 @@ public:
     QString addSection(const QString &project, const QString &title);
     QString saveTask(Task task);
     void toggle(const QString &id);
+    void updateRemote(const Task &previous, Task updated);
+    QList<QPair<QString, QString>> reminders(const QDateTime &from, const QDateTime &through) const;
     void remove(const QString &id);
     void importReadOnly(const QList<RemoteList> &lists);
     QSqlQuery query(const Filter &filter) const;
