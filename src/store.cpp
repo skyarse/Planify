@@ -331,6 +331,26 @@ void Store::toggle(const QString &id)
     saveTask(t);
 }
 
+void Store::insertRemote(const Task &created)
+{
+    const auto owner = project(created.project);
+    if (!owner.remote() || !created.remote() || created.id.isEmpty() || created.remoteUid.isEmpty() ||
+        !created.parent.isEmpty() || !created.remoteParentUid.isEmpty())
+        throw std::runtime_error("Не удалось сохранить в локальный список новую задачу Baïkal");
+    failUnless(db.transaction(), db.lastError());
+    try {
+        const auto existing = task(created.id);
+        if (existing.id.isEmpty())
+            writeTask(created);
+        else if (existing.href != created.href || existing.remoteUid != created.remoteUid || existing.project != created.project)
+            throw std::runtime_error("Локальные данные задачи Baïkal конфликтуют. Обновите список");
+        failUnless(db.commit(), db.lastError());
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+}
+
 void Store::updateRemote(const Task &previous, Task updated)
 {
     const auto cached = task(previous.id);

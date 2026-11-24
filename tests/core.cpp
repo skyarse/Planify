@@ -11,6 +11,7 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QTimeZone>
+#include <algorithm>
 #include <stdexcept>
 
 namespace {
@@ -62,6 +63,11 @@ struct MockServer {
     QByteArray responseTag = R"("v1")";
     bool conflict = false;
     int writes = 0;
+    int creates = 0;
+    bool rejectCreate = false;
+    bool rejectConfirmation = false;
+    bool guardedCreate = false;
+    QHash<QByteArray, QByteArray> createdCalendars;
     qsizetype skipped = 0;
     qsizetype recovered = 0;
 
@@ -137,6 +143,23 @@ struct MockServer {
             status = "200 OK";
             etag = "ETag: " + responseTag + "\r\n";
             body = serverCalendar;
+        } else if (path.startsWith("/dav.php/calendars/demo/tasks/") && path.endsWith(".ics") && method == "PUT") {
+            guardedCreate = std::any_of(headers.cbegin(), headers.cend(), [](const auto &header) {
+                return header.trimmed().toLower() == "if-none-match: *";
+            });
+            if (rejectCreate) {
+                status = "403 Forbidden";
+            } else if (createdCalendars.contains(path)) {
+                status = "412 Precondition Failed";
+            } else {
+                ++creates;
+                createdCalendars.insert(path, received.mid(split + 4, length));
+                status = "201 Created";
+            }
+        } else if (method == "GET" && createdCalendars.contains(path)) {
+            status = rejectConfirmation ? "503 Unavailable" : "200 OK";
+            etag = "ETag: \"created\"\r\n";
+            body = createdCalendars.value(path);
         } else if (method == "REPORT" && path == "/dav.php/calendars/demo/tasks/") {
             validQuery = received.mid(split + 4).contains("name='VTODO'");
             QByteArray tasks;
@@ -168,6 +191,31 @@ struct MockServer {
             "Connection: close\r\n" + challenge + etag + "Content-Length: " + QByteArray::number(body.size()) +
             "\r\n\r\n" + body);
         socket->disconnectFromHost();
+    }
+
+    bool create(Store &store, const Project &project, const Task &draft, const QString &token)
+    {
+        CalDav client;
+        QEventLoop loop;
+        bool created = false;
+        QString error;
+        QObject::connect(&client, &CalDav::created, &loop, [&](const Task &task) {
+            store.insertRemote(task);
+            created = true;
+            loop.quit();
+        });
+        QObject::connect(&client, &CalDav::failed, &loop, [&](const QString &reason) {
+            error = reason;
+            loop.quit();
+        });
+        const auto url = QUrl(QString("http://127.0.0.1:%1/dav.php").arg(server.serverPort()));
+        expect(client.connectAccount(url, "demo", "local"), "mock account not connected");
+        if (client.create(project, draft, token)) {
+            QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+            loop.exec();
+        }
+        expect(created || !error.isEmpty(), "mock creation timed out");
+        return created;
     }
 
     bool edit(Store &store, const Task &original, Task draft)
@@ -462,6 +510,50 @@ void remoteWrites(const QString &path)
     expect(CalDav::exportTask(completed) == completed.calendarData, "export changed remote calendar");
 }
 
+
+void remoteCreation(const QString &path)
+{
+    Store store(path);
+    MockServer mock;
+    expect(mock.import(store), "mock import for creation failed");
+    const auto project = store.projects().first();
+    Filter page;
+    page.page = Page::Project;
+    page.project = project.id;
+    Task draft;
+    draft.project = project.id;
+    draft.title = "Новая задача";
+    draft.notes = "Проверить создание";
+    draft.tags = "alpha, alpha, beta";
+    draft.due = QDate(2026, 12, 1);
+    draft.deadline = QDate(2026, 12, 2);
+    draft.priority = 2;
+    draft.pinned = true;
+    const QString uuid = "e1676916-e089-45b2-9074-8707d4ce4059";
+    mock.rejectCreate = true;
+    expect(!mock.create(store, project, draft, uuid) && ids(store.query(page)).size() == 2 && mock.creates == 0,
+           "failed creation modified the cache");
+    mock.rejectCreate = false;
+    mock.rejectConfirmation = true;
+    expect(!mock.create(store, project, draft, uuid) && ids(store.query(page)).size() == 2 &&
+           mock.guardedCreate && mock.creates == 1, "unconfirmed remote creation treated as saved");
+    mock.rejectConfirmation = false;
+    expect(mock.create(store, project, draft, uuid) && mock.creates == 1,
+           "retry of an accepted creation duplicated it or failed to recover");
+    const auto tasks = ids(store.query(page));
+    const auto created = store.task(tasks.first());
+    expect(tasks.size() == 3 && created.remote() && created.remoteUid == uuid + "@plan-tasks" &&
+           created.etag == "\"created\"" && created.title == draft.title && created.notes == draft.notes &&
+           created.due == draft.due && created.deadline == draft.deadline && created.priority == draft.priority &&
+           created.tags == "alpha, beta", "created task was not cached in the chosen calendar");
+    draft.notes = "Edited after uncertainty";
+    expect(!mock.create(store, project, draft, uuid) && mock.creates == 1 &&
+           store.task(created.id).notes == created.notes, "retry overwrote existing remote task");
+    const QString secondUuid = "9d2bbe21-0153-42fc-9e09-38c479757253";
+    expect(mock.create(store, project, draft, secondUuid) && mock.creates == 2 && ids(store.query(page)).size() == 4,
+           "new request and confirmation did not persist a second task");
+}
+
 }
 
 int main(int argc, char **argv)
@@ -473,6 +565,7 @@ int main(int argc, char **argv)
         localTasks(root.filePath("local.sqlite"));
         remoteTasks(root.filePath("remote.sqlite"));
         remoteWrites(root.filePath("remote-writes.sqlite"));
+        remoteCreation(root.filePath("remote-creation.sqlite"));
         backupTasks(root);
         return 0;
     } catch (const std::exception &error) {

@@ -7,6 +7,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QTimeZone>
+#include <QUuid>
 #include <QXmlStreamReader>
 #include <libical/ical.h>
 #include <algorithm>
@@ -722,6 +723,53 @@ QByteArray CalDav::exportTask(const Task &task)
     return serialize(calendar.get());
 }
 
+bool CalDav::create(const Project &project, const Task &draft, const QString &token)
+{
+    if (active)
+        return false;
+    try {
+        const QUuid uuid(token);
+        if (uuid.isNull() || draft.project != project.id || !draft.id.isEmpty() || draft.remote() ||
+            !draft.parent.isEmpty() || !draft.section.isEmpty() || !connected(project))
+            fail(QStringLiteral("Выберите доступный список задач Baïkal"));
+        if (draft.title.trimmed().isEmpty())
+            fail(QStringLiteral("Введите название задачи"));
+        if (draft.deadline.isValid() && !draft.due.isValid())
+            fail(QStringLiteral("Задайте дату начала, чтобы отдельно указать срок"));
+        for (const auto &link : draft.attachments) {
+            const QUrl attachment(link, QUrl::StrictMode);
+            if (!attachment.isValid() || attachment.host().isEmpty() || !attachment.userInfo().isEmpty() ||
+                (attachment.scheme() != "http" && attachment.scheme() != "https"))
+                fail(QStringLiteral("В задачу Baïkal можно добавить только вложения по ссылке HTTP или HTTPS"));
+        }
+        const auto collectionUrl = resolve(origin, project.href);
+        auto path = collectionUrl.path(QUrl::FullyEncoded);
+        if (!path.endsWith('/'))
+            path += '/';
+        auto url = collectionUrl;
+        auto expected = draft;
+        expected.id = uuid.toString(QUuid::WithoutBraces);
+        expected.remoteUid = expected.id + "@plan-tasks";
+        url.setPath(path + expected.id + ".ics", QUrl::StrictMode);
+        if (!url.isValid() || url.hasQuery())
+            fail(QStringLiteral("Список Baïkal имеет неподдерживаемый адрес"));
+        const auto body = exportTask(expected);
+        if (body.isEmpty() || body.size() > maxReplyBytes)
+            fail(QStringLiteral("Не удалось подготовить новую задачу Baïkal"));
+        bool recovered = false;
+        const auto serialized = readTask(project, {}, Properties{.ical = body}, recovered);
+        if (!serialized)
+            fail(QStringLiteral("Не удалось прочитать подготовленную задачу Baïkal"));
+        expected = *serialized;
+        active = true;
+        requestWrite(project, url, expected, body);
+        return true;
+    } catch (const std::exception &error) {
+        emit failed(QString::fromUtf8(error.what()));
+        return false;
+    }
+}
+
 bool CalDav::update(const Project &project, const Task &previous, const Task &draft)
 {
     if (active)
@@ -767,7 +815,7 @@ bool CalDav::update(const Project &project, const Task &previous, const Task &dr
         if (body.isEmpty() || body.size() > maxReplyBytes)
             fail(QStringLiteral("Не удалось подготовить изменения задачи Baïkal"));
         active = true;
-        requestUpdate(project, url, previous, body);
+        requestWrite(project, url, previous, body);
         return true;
     } catch (const std::exception &error) {
         emit failed(QString::fromUtf8(error.what()));
@@ -775,15 +823,20 @@ bool CalDav::update(const Project &project, const Task &previous, const Task &dr
     }
 }
 
-void CalDav::requestUpdate(const Project &project, const QUrl &url, const Task &previous, const QByteArray &body)
+void CalDav::requestWrite(const Project &project, const QUrl &url, const Task &expected, const QByteArray &body,
+                          bool verifyRetry)
 {
     QNetworkRequest settings(url);
     settings.setTransferTimeout(20000);
     settings.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    const bool creating = !expected.remote();
     const bool reading = body.isEmpty();
     if (!reading) {
         settings.setHeader(QNetworkRequest::ContentTypeHeader, "text/calendar; charset=utf-8");
-        settings.setRawHeader("If-Match", previous.etag.toLatin1());
+        if (creating)
+            settings.setRawHeader("If-None-Match", "*");
+        else
+            settings.setRawHeader("If-Match", expected.etag.toLatin1());
     }
     auto *reply = reading ? network.get(settings) : network.put(settings, body);
     reply->setReadBufferSize(maxReplyBytes + 1);
@@ -799,24 +852,45 @@ void CalDav::requestUpdate(const Project &project, const QUrl &url, const Task &
             password.clear();
             network.clearAccessCache();
         }
-        if (status == 409 || status == 412) {
-            notify(QStringLiteral("Задача изменилась на сервере. Обновите списки Baïkal и повторите действие"));
+        if (creating && !reading && status == 412) {
+            requestWrite(project, url, expected, {}, true);
+        } else if (status == 409 || status == 412) {
+            notify(QStringLiteral("Сервер Baïkal сообщил о конфликте. Обновите списки и повторите действие"));
         } else if (status < 200 || status >= 300 || reply->error() != QNetworkReply::NoError) {
-            notify(reading ? QStringLiteral("Изменение отправлено. Обновите списки, чтобы получить состояние задачи")
-                           : QStringLiteral("Baïkal не подтвердил изменение (%1). Обновите списки перед повтором")
-                                 .arg(status ? QString::number(status) : reply->errorString()));
+            if (creating) {
+                notify(reading && !verifyRetry
+                    ? QStringLiteral("Baïkal принял запрос. Нажмите «Создать» ещё раз, чтобы проверить состояние задачи")
+                    : QStringLiteral("Baïkal не подтвердил создание (%1). Черновик сохранён в окне")
+                        .arg(status ? QString::number(status) : reply->errorString()));
+            } else {
+                notify(reading ? QStringLiteral("Изменение отправлено. Обновите списки, чтобы получить состояние задачи")
+                               : QStringLiteral("Baïkal не подтвердил изменение (%1). Обновите списки перед повтором")
+                                     .arg(status ? QString::number(status) : reply->errorString()));
+            }
         } else if (!reading) {
-            requestUpdate(project, url, previous, {});
+            requestWrite(project, url, expected, {});
         } else {
             bool recovered = false;
-            const auto changed = readTask(project, previous.href,
+            const auto changed = readTask(project, creating ? url.toString(QUrl::FullyEncoded) : expected.href,
                 Properties{.etag = QString::fromLatin1(reply->rawHeader("ETag")), .ical = reply->readAll()}, recovered);
-            if (!changed || changed->id != previous.id) {
-                notify(QStringLiteral("Не удалось подтвердить изменения. Обновите списки Baïkal"));
+            if (!changed || (creating ? changed->remoteUid != expected.remoteUid : changed->id != expected.id)) {
+                notify(QStringLiteral("Не удалось подтвердить задачу в Baïkal. Обновите списки"));
+                return;
+            }
+            if (verifyRetry && (changed->title != expected.title || changed->notes != expected.notes ||
+                changed->due != expected.due || changed->deadline != expected.deadline ||
+                changed->priority != expected.priority || changed->pinned != expected.pinned ||
+                changed->reminder != expected.reminder || changed->attachments != expected.attachments ||
+                changed->taskTemplate != expected.taskTemplate || changed->tags != expected.tags ||
+                changed->repeat != expected.repeat || changed->done != expected.done)) {
+                notify(QStringLiteral("Задача уже есть в Baïkal. Обновите список, чтобы увидеть её и внести изменения"));
                 return;
             }
             active = false;
-            emit updated(previous, *changed);
+            if (creating)
+                emit created(*changed);
+            else
+                emit updated(expected, *changed);
         }
     });
 }

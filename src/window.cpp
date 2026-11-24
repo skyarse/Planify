@@ -44,6 +44,8 @@
 #include <QTextBoundaryFinder>
 #include <QVBoxLayout>
 #include <QWindow>
+#include <QWidgetAction>
+#include <QUuid>
 #include <QGuiApplication>
 #include <QDir>
 #include <QFile>
@@ -302,6 +304,21 @@ public:
 
 };
 
+class TaskDialog : public QDialog {
+public:
+    TaskDialog(QWidget *parent, std::function<void()> cancel)
+        : QDialog(parent), cancel(std::move(cancel))
+    {
+        setWindowModality(Qt::WindowModal);
+        setWindowFlags(Qt::Dialog | Qt::CustomizeWindowHint | Qt::WindowTitleHint | Qt::WindowCloseButtonHint);
+    }
+
+    void reject() override { cancel(); }
+
+private:
+    std::function<void()> cancel;
+};
+
 class TaskView : public QListView {
 public:
     TaskView(std::function<void(const QString &)> toggle, QWidget *parent)
@@ -531,11 +548,25 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     search->hide();
     body->addWidget(search);
 
-    composer = new QWidget(center);
+    composer = new TaskDialog(this, [this] { if (mayDiscard()) closeCard(); });
+    composer->setObjectName("taskComposer");
     auto *composeLayout = new QVBoxLayout(composer);
-    composeLayout->setContentsMargins(1, 0, 1, 0);
-    composer->hide();
-    body->addWidget(composer);
+    composeLayout->setContentsMargins(14, 12, 14, 12);
+    composeLayout->setSpacing(9);
+    composerStatus = caption({}, composer, "composerStatus");
+    composerStatus->setWordWrap(true);
+    composerStatus->hide();
+    composeLayout->addWidget(composerStatus);
+    composerFooter = new QHBoxLayout;
+    destination = button({}, composer, "destination");
+    destination->setAccessibleName(QStringLiteral("Выбрать список или проект"));
+    destination->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+    destination->setMaximumWidth(330);
+    destination->setAutoDefault(false);
+    composerFooter->addWidget(destination);
+    composerFooter->addStretch();
+    composeLayout->addLayout(composerFooter);
+    connect(destination, &QPushButton::clicked, this, &Window::chooseDestination);
     parking = new QWidget(center);
     parking->hide();
 
@@ -613,6 +644,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     details->addWidget(notes);
 
     auto *actions = new QHBoxLayout;
+    cardToolbar = actions;
     actions->setSpacing(3);
     dateButton = iconButton(editor, Mark::Calendar, QStringLiteral("Дата"));
     actions->addWidget(dateButton);
@@ -626,6 +658,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     for (auto *tool : {attachments, labelButton, priorityButton, reminderButton, completedDate, taskMenuButton})
         actions->addWidget(tool);
     save = button(QStringLiteral("Сохранить"), editor, "primary");
+    save->setAutoDefault(false);
     actions->addWidget(save);
     details->addLayout(actions);
 
@@ -774,8 +807,10 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         connect(date, &QDateEdit::dateChanged, this, markDirty);
     connect(reminder, &QDateTimeEdit::dateTimeChanged, this, markDirty);
     connect(project, &QComboBox::currentIndexChanged, this, [this, markDirty] {
-        if (!loading)
+        if (!loading) {
             reloadSections(project->currentData().toString());
+            updateDestination();
+        }
         markDirty();
     });
     connect(closeEditor, &QPushButton::clicked, this, [this] { if (mayDiscard()) closeCard(); });
@@ -895,6 +930,18 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         syncButton->setEnabled(true);
         message(error);
     });
+    connect(&caldav, &CalDav::created, this, [this](const Task &created) {
+        writing = false;
+        writingId.clear();
+        syncButton->setEnabled(true);
+        updateCardActions();
+        try {
+            store.insertRemote(created);
+            taskCreated(created);
+        } catch (const std::exception &error) {
+            message(QString::fromUtf8(error.what()));
+        }
+    });
     connect(&caldav, &CalDav::updated, this, [this](const Task &previous, const Task &updated) {
         writing = false;
         writingId.clear();
@@ -993,6 +1040,11 @@ void Window::setTheme(const QString &option)
     auto css = QStringLiteral(R"CSS(
         QLabel, QCheckBox, QListWidget#projects, QPushButton { color: %2; }
         QWidget#frame, QWidget#windowRoot, QDialog#preferences, QWidget#settingsPage { background: %1; color: %2; }
+        QDialog#taskComposer { background: %1; }
+        QPushButton#destination { padding: 7px 10px; border: 1px solid %4; border-radius: 8px;
+            background: %7; text-align: left; font-weight: 600; }
+        QPushButton#destination:hover { background: %5; }
+        QLabel#composerStatus { color: %2; }
         QDialog#preferences { border: 1px solid %4; border-radius: 11px; }
         QLabel#brand, QLabel#settingsTitle { font-size: 14px; font-weight: bold; }
         QLabel#pageIcon { background: rgba(51,132,237,30); border-radius: 6px; }
@@ -1335,6 +1387,9 @@ void Window::editTask(const Task &task)
     loading = true;
     dirty = false;
     current = task;
+    creationToken = task.id.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : QString();
+    composerStatus->clear();
+    composerStatus->hide();
     if (current.remote() && current.attachments.isEmpty() && !current.reminder.isValid())
         CalDav::populateDetails(current);
     const bool editable = task.repeat != "remote";
@@ -1355,13 +1410,14 @@ void Window::editTask(const Task &task)
     project->clear();
     project->addItem(QStringLiteral("Входящие"), Store::inbox());
     for (const auto &p : store.projects())
-        if (!p.remote() || p.id == task.project)
+        if (task.id.isEmpty() || !p.remote() || p.id == task.project)
             project->addItem(p.title, p.id);
     selectData(project, task.project);
     reloadSections(task.project, task.section);
     project->setEnabled(!task.remote() && task.parent.isEmpty());
     section->setEnabled(!task.remote());
     repeat->setEnabled(!task.remote());
+    updateDestination();
     title->setReadOnly(!editable);
     notes->setReadOnly(!editable);
     tags->setReadOnly(!editable);
@@ -1384,6 +1440,9 @@ void Window::editTask(const Task &task)
 void Window::unmountCard()
 {
     editor->hide();
+    if (save->parentWidget() == composer)
+        cardToolbar->addWidget(save);
+    save->setVisible(current.repeat != "remote");
     editor->setParent(parking);
     composer->hide();
     if (expandedView && expandedIndex.isValid()) {
@@ -1423,10 +1482,25 @@ void Window::mountCard()
             }
         }
     }
-    composer->layout()->addWidget(editor);
-    empty->hide();
-    composer->show();
+    const bool creating = current.id.isEmpty();
+    static_cast<QVBoxLayout *>(composer->layout())->insertWidget(0, editor);
+    destination->setVisible(creating);
+    composer->setWindowTitle(creating ? (current.parent.isEmpty() ? QStringLiteral("Новая задача")
+        : QStringLiteral("Новая подзадача")) : QStringLiteral("Задача"));
+    if (creating) {
+        composerFooter->addWidget(save);
+        save->setText(QStringLiteral("Создать"));
+        save->show();
+        updateDestination();
+    }
+    for (auto *button : editor->findChildren<QPushButton *>())
+        button->setAutoDefault(false);
     editor->show();
+    composer->setFixedWidth(qBound(410, width() * 2 / 3, 600));
+    composer->adjustSize();
+    composer->show();
+    if (creating)
+        title->setFocus();
 }
 
 void Window::closeCard()
@@ -1445,6 +1519,8 @@ void Window::resizeCard()
         auto *delegate = static_cast<TaskDelegate *>(expandedView->itemDelegate());
         delegate->expandedHeight = editor->sizeHint().height() + 4;
         expandedView->doItemsLayout();
+    } else if (composer->isVisible()) {
+        composer->adjustSize();
     }
 }
 
@@ -1464,7 +1540,9 @@ void Window::updateCardActions()
     completion->setAccessibleName(checked);
     completion->setToolTip(checked);
     editor->setEnabled(!writing || current.id != writingId);
+    destination->setEnabled(!writing && current.parent.isEmpty());
     save->setVisible(current.repeat != "remote");
+    save->setText(current.id.isEmpty() ? QStringLiteral("Создать") : QStringLiteral("Сохранить"));
     save->setEnabled(!writing && (dirty || current.id.isEmpty()));
     dateButton->setToolTip(due->date() == noDate ? QStringLiteral("Дата") :
         QStringLiteral("Дата · %1").arg(QLocale().toString(due->date(), QLocale::ShortFormat)));
@@ -1477,7 +1555,7 @@ void Window::updateCardActions()
 }
 void Window::newTask(const QString &parent)
 {
-    if (!mayDiscard())
+    if (writing || !mayDiscard())
         return;
     Task task;
     task.project = Store::inbox();
@@ -1486,13 +1564,118 @@ void Window::newTask(const QString &parent)
     if (!parent.isEmpty()) {
         task.project = current.project;
         task.section = current.section;
-    } else if (filter.page == Page::Project && !store.project(filter.project).remote()) {
+    } else if (filter.page == Page::Project && !filter.project.isEmpty()) {
         task.project = filter.project;
     } else if (filter.page == Page::Today) {
         task.due = QDate::currentDate();
     }
     editTask(task);
     title->setFocus();
+}
+
+void Window::updateDestination()
+{
+    if (!current.id.isEmpty())
+        return;
+    const auto owner = store.project(project->currentData().toString());
+    const bool remote = owner.remote();
+    destination->setIcon(markIcon(owner.id == Store::inbox() ? Mark::Inbox : remote ? Mark::Cloud : Mark::Project,
+        palette().color(QPalette::WindowText)));
+    destination->setText(QFontMetrics(destination->font()).elidedText(project->currentText(), Qt::ElideRight, 268)
+                         + QStringLiteral("  ▾"));
+    destination->setToolTip(project->currentText());
+    section->setEnabled(!remote);
+    repeat->setEnabled(!remote);
+    if (remote)
+        repeat->setCurrentIndex(0);
+}
+
+void Window::chooseDestination()
+{
+    auto *menu = new QMenu(composer);
+    menu->setObjectName("destinationPicker");
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    auto *action = new QWidgetAction(menu);
+    auto *body = new QWidget(menu);
+    auto *layout = new QVBoxLayout(body);
+    layout->setContentsMargins(4, 4, 4, 4);
+    auto *query = new QLineEdit(body);
+    query->setPlaceholderText(QStringLiteral("Найти список или проект"));
+    query->setAccessibleName(query->placeholderText());
+    query->setClearButtonEnabled(true);
+    layout->addWidget(query);
+    auto *choices = new QListWidget(body);
+    choices->setAccessibleName(QStringLiteral("Списки задач"));
+    choices->setUniformItemSizes(true);
+    choices->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    choices->setFixedSize(310, 212);
+    layout->addWidget(choices);
+    const auto add = [&](const QString &label, const QString &id, const QString &group, Mark icon) {
+        auto *entry = new QListWidgetItem(markIcon(icon, palette().color(QPalette::WindowText)), label, choices);
+        entry->setData(Qt::UserRole, id);
+        entry->setToolTip(group.isEmpty() ? label : group + QStringLiteral(" · ") + label);
+        entry->setSizeHint(QSize(0, 30));
+        if (id == project->currentData().toString())
+            choices->setCurrentItem(entry);
+    };
+    add(QStringLiteral("Входящие"), Store::inbox(), {}, Mark::Inbox);
+    QString lastGroup;
+    for (const auto &owner : store.projects()) {
+        const auto group = owner.remote() ? owner.account : QStringLiteral("На этом компьютере");
+        if (group != lastGroup) {
+            auto *heading = new QListWidgetItem(group, choices);
+            heading->setFlags(Qt::NoItemFlags);
+            heading->setForeground(palette().brush(QPalette::PlaceholderText));
+            auto font = heading->font();
+            font.setBold(true);
+            heading->setFont(font);
+            heading->setSizeHint(QSize(0, 30));
+            lastGroup = group;
+        }
+        add(owner.title, owner.id, group, owner.remote() ? Mark::Cloud : Mark::Project);
+    }
+    const auto choose = [this, menu](QListWidgetItem *entry) {
+        if (!entry)
+            return;
+        const auto id = entry->data(Qt::UserRole).toString();
+        if (id.isEmpty())
+            return;
+        selectData(project, id);
+        menu->close();
+        title->setFocus();
+    };
+    connect(choices, &QListWidget::itemClicked, menu, choose);
+    connect(choices, &QListWidget::itemActivated, menu, choose);
+    connect(query, &QLineEdit::textChanged, menu, [choices](const QString &text) {
+        QListWidgetItem *heading = nullptr;
+        for (int i = 0; i < choices->count(); ++i) {
+            auto *item = choices->item(i);
+            if (item->data(Qt::UserRole).toString().isEmpty()) {
+                heading = item;
+                heading->setHidden(true);
+                continue;
+            }
+            const bool matches = item->toolTip().contains(text.trimmed(), Qt::CaseInsensitive);
+            item->setHidden(!matches);
+            if (heading && matches)
+                heading->setHidden(false);
+        }
+    });
+    connect(query, &QLineEdit::returnPressed, menu, [choices, choose] {
+        for (int i = 0; i < choices->count(); ++i) {
+            auto *item = choices->item(i);
+            if (!item->isHidden() && (item->flags() & Qt::ItemIsSelectable)) {
+                choose(item);
+                return;
+            }
+        }
+    });
+    action->setDefaultWidget(body);
+    menu->addAction(action);
+    menu->popup(destination->mapToGlobal(QPoint(0, destination->height() + 3)));
+    query->setFocus();
+    if (choices->currentItem())
+        choices->scrollToItem(choices->currentItem());
 }
 
 void Window::reloadSections(const QString &projectId, const QString &selected)
@@ -1526,7 +1709,7 @@ void Window::reloadSubtasks()
 
 void Window::saveTask()
 {
-    if (writing || !cardOpen || current.repeat == "remote")
+    if (loading || writing || !cardOpen || current.repeat == "remote")
         return;
     try {
         auto draft = current;
@@ -1542,6 +1725,30 @@ void Window::saveTask()
         draft.pinned = pinned->isChecked();
         draft.reminder = reminder->dateTime().date() == noDate ? QDateTime() : reminder->dateTime().toUTC();
         draft.taskTemplate = templateAction->isChecked();
+        if (draft.title.isEmpty()) {
+            message(QStringLiteral("Введите название задачи"));
+            title->setFocus();
+            return;
+        }
+        const bool creating = draft.id.isEmpty();
+        if (creating) {
+            const auto owner = store.project(draft.project);
+            if (owner.remote()) {
+                if (syncing) {
+                    message(QStringLiteral("Дождитесь завершения обмена с Baïkal"));
+                    return;
+                }
+                if (!caldav.connected(owner) && !authorize(owner))
+                    return;
+                if (!caldav.create(owner, draft, creationToken))
+                    return;
+                writing = true;
+                writingId.clear();
+                updateCardActions();
+                message(QStringLiteral("Создаю задачу в Baïkal…"));
+                return;
+            }
+        }
         if (draft.remote()) {
             auto before = current;
             CalDav::populateDetails(before);
@@ -1549,12 +1756,51 @@ void Window::saveTask()
             return;
         }
         const auto id = store.saveTask(draft);
-        current.id = id;
+        if (creating) {
+            taskCreated(store.task(id));
+            return;
+        }
         refreshAfterMutation(id);
         message(QStringLiteral("Задача сохранена"));
     } catch (const std::exception &error) {
         message(QString::fromUtf8(error.what()));
     }
+}
+
+void Window::taskCreated(const Task &task)
+{
+    closeCard();
+    refreshNavigation();
+    refresh();
+    const auto selectTask = [this, &task] {
+        const auto views = boardArea->isVisible() ? boardViews : QList<QListView *>{list};
+        for (auto *view : views) {
+            auto *tasks = view->model();
+            for (int row = 0; ; ++row) {
+                if (row == tasks->rowCount()) {
+                    if (!tasks->canFetchMore({}))
+                        break;
+                    tasks->fetchMore({});
+                    if (row == tasks->rowCount())
+                        break;
+                }
+                const auto index = tasks->index(row, 0);
+                if (index.data().toString() == task.id) {
+                    view->setCurrentIndex(index);
+                    view->scrollTo(index);
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (!selectTask()) {
+        selectPage(task.project == Store::inbox() ? Page::Inbox : Page::Project, task.project);
+        selectTask();
+    }
+    const auto owner = store.project(task.project);
+    message(task.remote() ? QStringLiteral("Задача создана в Baïkal · %1").arg(owner.title)
+                          : QStringLiteral("Задача создана · %1").arg(owner.title));
 }
 
 void Window::toggleTask(const QString &id)
@@ -1667,7 +1913,7 @@ void Window::showAttachments(QWidget *anchor)
                 updateCardActions();
             }
         });
-        if (!current.remote()) {
+        if (!current.remote() && !store.project(project->currentData().toString()).remote()) {
             menu->addAction(QStringLiteral("Добавить локальный файл"), this, [this] {
                 const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("Добавить файл"));
                 if (path.isEmpty())
@@ -1765,7 +2011,7 @@ void Window::showSync()
 
 bool Window::authorize(const Project &owner, bool refreshLists)
 {
-    QDialog dialog(this);
+    QDialog dialog(composer->isVisible() ? composer : static_cast<QWidget *>(this));
     dialog.setWindowTitle(refreshLists ? QStringLiteral("Baïkal") : QStringLiteral("Подключение к Baïkal"));
     auto *layout = new QFormLayout(&dialog);
     auto *help = new QLabel(refreshLists
@@ -1813,20 +2059,27 @@ bool Window::authorize(const Project &owner, bool refreshLists)
 void Window::message(const QString &text)
 {
     status->setText(text);
+    if (composer->isVisible()) {
+        composerStatus->setText(text);
+        composerStatus->setVisible(!text.isEmpty());
+        composer->adjustSize();
+    }
 }
 
 bool Window::smokeTest()
 {
     newTask();
-    if (!editor->isVisible())
+    if (!composer->isVisible() || !editor->isVisible() || !save->isVisible() || composer->width() >= width())
+        return false;
+    save->click();
+    if (!composer->isVisible() || !composerStatus->isVisible() || model->rowCount() != 0)
         return false;
     title->setText(QStringLiteral("Проверка карточки"));
     due->setDate(QDate::currentDate());
-    saveTask();
-    if (current.id.isEmpty() || model->rowCount() != 1)
+    save->click();
+    if (composer->isVisible() || model->rowCount() != 1)
         return false;
-    const auto id = current.id;
-    closeCard();
+    const auto id = model->index(0, 0).data().toString();
     const auto clickRow = [this](const QPoint &point) {
         auto *target = list->viewport();
         const auto global = target->mapToGlobal(point);
@@ -1853,9 +2106,32 @@ bool Window::smokeTest()
     selectPage(Page::Completed);
     if (model->rowCount() != 1 || !store.task(id).completed.isValid())
         return false;
-    const auto sample = store.addProject(QStringLiteral("Проект"));
-    store.addSection(sample, QStringLiteral("Испытание доски"));
-    selectPage(Page::Project, sample);
+    const auto sample = store.addProject(QStringLiteral("Тестовый проект"));
+    const auto sampleSection = store.addSection(sample, QStringLiteral("Испытание доски"));
+    constexpr auto remoteProject = "remote-example";
+    store.importReadOnly({RemoteList{Project{remoteProject, QStringLiteral("Список Baïkal для проверки"),
+        "tester@example.org", "https://example.org/tasks/"}, {}}});
+    selectPage(Page::Project, remoteProject);
+    newTask();
+    if (!composer->isVisible() || project->currentData().toString() != remoteProject)
+        return false;
+    destination->click();
+    auto *picker = composer->findChild<QMenu *>("destinationPicker");
+    if (!picker || !picker->isVisible())
+        return false;
+    auto *projectSearch = picker->findChild<QLineEdit *>();
+    if (!projectSearch)
+        return false;
+    projectSearch->setText(QStringLiteral("Тестовый проект"));
+    QMetaObject::invokeMethod(projectSearch, "returnPressed");
+    if (project->currentData().toString() != sample)
+        return false;
+    selectData(section, sampleSection);
+    title->setText(QStringLiteral("Создано в выбранном проекте"));
+    QMetaObject::invokeMethod(title, "returnPressed");
+    if (composer->isVisible() || filter.project != sample || model->rowCount() != 1 ||
+        store.task(model->index(0, 0).data().toString()).section != sampleSection)
+        return false;
     board = true;
     refresh();
     if (!boardArea->isVisible() || boardModels.size() != 2)

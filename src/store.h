@@ -86,6 +86,7 @@ public:
     QString addSection(const QString &project, const QString &title);
     QString saveTask(Task task);
     void toggle(const QString &id);
+    void insertRemote(const Task &created);
     void updateRemote(const Task &previous, Task updated);
     QList<QPair<QString, QString>> reminders(const QDateTime &from, const QDateTime &through) const;
     void remove(const QString &id);

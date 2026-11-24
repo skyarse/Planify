@@ -12,6 +12,7 @@
 class QAction;
 class QCheckBox;
 class QCloseEvent;
+class QHBoxLayout;
 class QDialog;
 class QShortcut;
 class QComboBox;
@@ -80,7 +81,12 @@ private:
     QSqlQueryModel *model;
     QList<QSqlQueryModel *> boardModels;
     QList<QListView *> boardViews;
-    QWidget *composer;
+    QDialog *composer;
+    QHBoxLayout *composerFooter;
+    QHBoxLayout *cardToolbar;
+    QPushButton *destination;
+    QLabel *composerStatus;
+    QString creationToken;
     QWidget *parking;
     QPointer<QListView> expandedView;
     QPersistentModelIndex expandedIndex;
@@ -120,6 +126,9 @@ private:
     void openTask(const QString &id);
     void editTask(const Task &task);
     void newTask(const QString &parent = {});
+    void chooseDestination();
+    void updateDestination();
+    void taskCreated(const Task &task);
     void reloadSections(const QString &projectId, const QString &selected = {});
     void reloadSubtasks();
     void saveTask();
