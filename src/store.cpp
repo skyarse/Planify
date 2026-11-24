@@ -50,8 +50,15 @@ QString normalizedTags(const QString &input)
 
 Project readProject(const QSqlQuery &q)
 {
-    return {q.value(0).toString(), q.value(1).toString(), q.value(2).toString(), q.value(3).toString()};
+    return {q.value(0).toString(), q.value(1).toString(), q.value(2).toString(), q.value(3).toString(),
+        q.value(4).toString(), q.value(5).toString(), q.value(6).toString(),
+        QDate::fromString(q.value(7).toString(), Qt::ISODate), q.value(8).toInt(),
+        q.value(9).toBool(), q.value(10).toBool()};
 }
+const QString projectFields = QStringLiteral(
+    "SELECT p.id,coalesce(o.title,p.title),p.account,p.href,o.notes,o.emoji,o.color,o.deadline,"
+    "o.markdown,o.favorite,o.archived FROM projects p LEFT JOIN project_options o ON o.id=p.id");
+
 }
 
 Store::Store(const QString &path) : connection(newId()), db(QSqlDatabase::addDatabase("QSQLITE", connection))
@@ -70,41 +77,50 @@ Store::Store(const QString &path) : connection(newId()), db(QSqlDatabase::addDat
             throw std::runtime_error("Не удалось определить версию базы");
         const int current = version.value(0).toInt();
         version.finish();
-        if (current > 2)
+        if (current > 3)
             throw std::runtime_error("Эта база создана более новой версией приложения");
-        if (current == 2)
+        if (current == 3)
             return;
         failUnless(db.transaction(), db.lastError());
+        if (current < 2) {
+            execute(R"SQL(
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, account TEXT NOT NULL DEFAULT '', href TEXT NOT NULL DEFAULT ''
+                )
+            )SQL");
+            execute(R"SQL(
+                CREATE TABLE IF NOT EXISTS sections (
+                    id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL
+                )
+            )SQL");
+            execute(R"SQL(
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id),
+                    section TEXT NOT NULL, parent TEXT NOT NULL, title TEXT NOT NULL, notes TEXT NOT NULL,
+                    tags TEXT NOT NULL, due TEXT NOT NULL, deadline TEXT NOT NULL, priority INTEGER NOT NULL,
+                    done INTEGER NOT NULL, pinned INTEGER NOT NULL, repeat TEXT NOT NULL,
+                    href TEXT NOT NULL, etag TEXT NOT NULL, ical BLOB NOT NULL,
+                    remote_uid TEXT NOT NULL, remote_parent_uid TEXT NOT NULL,
+                    title_norm TEXT NOT NULL, notes_norm TEXT NOT NULL, tags_norm TEXT NOT NULL
+                )
+            )SQL");
+            execute("CREATE INDEX IF NOT EXISTS tasks_project_done_due ON tasks(project, done, due)");
+            execute("CREATE INDEX IF NOT EXISTS tasks_done_due ON tasks(done, due)");
+            execute("CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent)");
+            execute("INSERT OR IGNORE INTO projects(id,title) VALUES('inbox','Входящие')");
+            execute("ALTER TABLE tasks ADD COLUMN completed TEXT NOT NULL DEFAULT ''");
+            execute("ALTER TABLE tasks ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'");
+            execute("ALTER TABLE tasks ADD COLUMN reminder TEXT NOT NULL DEFAULT ''");
+            execute("ALTER TABLE tasks ADD COLUMN task_template INTEGER NOT NULL DEFAULT 0");
+        }
         execute(R"SQL(
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL, account TEXT NOT NULL DEFAULT '', href TEXT NOT NULL DEFAULT ''
+            CREATE TABLE project_options (
+                id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                title TEXT, notes TEXT NOT NULL, emoji TEXT NOT NULL, color TEXT NOT NULL,
+                deadline TEXT NOT NULL, markdown INTEGER NOT NULL, favorite INTEGER NOT NULL, archived INTEGER NOT NULL
             )
         )SQL");
-        execute(R"SQL(
-            CREATE TABLE IF NOT EXISTS sections (
-                id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL
-            )
-        )SQL");
-        execute(R"SQL(
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(id),
-                section TEXT NOT NULL, parent TEXT NOT NULL, title TEXT NOT NULL, notes TEXT NOT NULL,
-                tags TEXT NOT NULL, due TEXT NOT NULL, deadline TEXT NOT NULL, priority INTEGER NOT NULL,
-                done INTEGER NOT NULL, pinned INTEGER NOT NULL, repeat TEXT NOT NULL,
-                href TEXT NOT NULL, etag TEXT NOT NULL, ical BLOB NOT NULL,
-                remote_uid TEXT NOT NULL, remote_parent_uid TEXT NOT NULL,
-                title_norm TEXT NOT NULL, notes_norm TEXT NOT NULL, tags_norm TEXT NOT NULL
-            )
-        )SQL");
-        execute("CREATE INDEX IF NOT EXISTS tasks_project_done_due ON tasks(project, done, due)");
-        execute("CREATE INDEX IF NOT EXISTS tasks_done_due ON tasks(done, due)");
-        execute("CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent)");
-        execute("INSERT OR IGNORE INTO projects(id,title) VALUES('inbox','Входящие')");
-        execute("ALTER TABLE tasks ADD COLUMN completed TEXT NOT NULL DEFAULT ''");
-        execute("ALTER TABLE tasks ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'");
-        execute("ALTER TABLE tasks ADD COLUMN reminder TEXT NOT NULL DEFAULT ''");
-        execute("ALTER TABLE tasks ADD COLUMN task_template INTEGER NOT NULL DEFAULT 0");
-        execute("PRAGMA user_version=2");
+        execute("PRAGMA user_version=3");
         failUnless(db.commit(), db.lastError());
     } catch (...) {
         db.close();
@@ -136,7 +152,7 @@ QString Store::inbox()
 QList<Project> Store::projects() const
 {
     QSqlQuery q(db);
-    const bool success = q.exec("SELECT id,title,account,href FROM projects WHERE id <> 'inbox' ORDER BY account,title COLLATE NOCASE");
+    const bool success = q.exec(projectFields + " WHERE p.id <> 'inbox' ORDER BY p.account,o.favorite DESC,coalesce(o.title,p.title) COLLATE NOCASE");
     failUnless(success, q.lastError());
     QList<Project> result;
     while (q.next())
@@ -147,7 +163,7 @@ QList<Project> Store::projects() const
 Project Store::project(const QString &id) const
 {
     QSqlQuery q(db);
-    q.prepare("SELECT id,title,account,href FROM projects WHERE id=?");
+    q.prepare(projectFields + " WHERE p.id=?");
     q.addBindValue(id);
     run(q);
     return q.next() ? readProject(q) : Project{};
@@ -212,6 +228,160 @@ QStringList Store::labels() const
                 result += tag;
     result.sort(Qt::CaseInsensitive);
     return result;
+}
+
+void Store::saveProject(const Project &entry)
+{
+    if (entry.id == inbox() || project(entry.id).id.isEmpty() || entry.title.trimmed().isEmpty())
+        throw std::runtime_error("Выберите проект и введите его название");
+    QSqlQuery q(db);
+    q.prepare(R"SQL(
+        INSERT INTO project_options VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+          title=excluded.title, notes=excluded.notes, emoji=excluded.emoji, color=excluded.color,
+          deadline=excluded.deadline, markdown=excluded.markdown, favorite=excluded.favorite, archived=excluded.archived
+    )SQL");
+    const auto base = [&] {
+        QSqlQuery query(db);
+        query.prepare("SELECT title FROM projects WHERE id=?");
+        query.addBindValue(entry.id);
+        run(query);
+        return query.next() ? query.value(0).toString() : QString();
+    }();
+    const auto title = entry.title.trimmed();
+    q.bindValue(0, entry.id);
+    q.bindValue(1, title == base ? QVariant(QMetaType::fromType<QString>()) : QVariant(title));
+    q.bindValue(2, entry.notes.isNull() ? QStringLiteral("") : entry.notes);
+    q.bindValue(3, entry.emoji.isNull() ? QStringLiteral("") : entry.emoji);
+    q.bindValue(4, entry.color.isNull() ? QStringLiteral("") : entry.color);
+    q.bindValue(5, entry.deadline.isValid() ? iso(entry.deadline) : QStringLiteral(""));
+    q.bindValue(6, entry.markdown);
+    q.bindValue(7, entry.favorite);
+    q.bindValue(8, entry.archived);
+    run(q);
+}
+
+QString Store::duplicateProject(const QString &id)
+{
+    auto source = project(id);
+    if (source.id.isEmpty() || source.id == inbox())
+        throw std::runtime_error("Выберите проект для копирования");
+    failUnless(db.transaction(), db.lastError());
+    try {
+        source.id = addProject(source.title + QStringLiteral(" (копия)"));
+        source.title += QStringLiteral(" (копия)");
+        source.archived = false;
+        saveProject(source);
+        QHash<QString, QString> sectionIds;
+        for (const auto &[sectionId, title] : sections(id))
+            sectionIds.insert(sectionId, addSection(source.id, title));
+        Filter filter;
+        filter.page = Page::Project;
+        filter.project = id;
+        filter.showDone = true;
+        auto rows = query(filter);
+        QList<Task> copies;
+        QHash<QString, QString> taskIds;
+        while (rows.next()) {
+            auto original = task(rows.value(0).toString());
+            const auto copyId = newId();
+            taskIds.insert(original.id, copyId);
+            original.id = copyId;
+            copies.append(original);
+        }
+        rows.finish();
+        for (auto copy : copies) {
+            copy.project = source.id;
+            copy.parent = taskIds.value(copy.parent);
+            copy.section = sectionIds.value(copy.section);
+            copy.href.clear();
+            copy.etag.clear();
+            copy.remoteUid.clear();
+            copy.remoteParentUid.clear();
+            copy.calendarData.clear();
+            if (copy.repeat == "remote")
+                copy.repeat.clear();
+            writeTask(copy);
+        }
+        failUnless(db.commit(), db.lastError());
+        return source.id;
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+}
+
+void Store::removeProject(const QString &id)
+{
+    const auto owner = project(id);
+    if (owner.id.isEmpty() || owner.id == inbox() || owner.remote())
+        throw std::runtime_error("Удаление доступно для локальных проектов");
+    failUnless(db.transaction(), db.lastError());
+    try {
+        for (const auto *sql : {"DELETE FROM tasks WHERE project=?", "DELETE FROM sections WHERE project=?",
+                                "DELETE FROM projects WHERE id=?"}) {
+            QSqlQuery q(db);
+            q.prepare(sql);
+            q.addBindValue(id);
+            run(q);
+        }
+        failUnless(db.commit(), db.lastError());
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
+}
+
+void Store::renameSection(const QString &projectId, const QString &sectionId, const QString &name)
+{
+    const auto owner = project(projectId);
+    if (owner.id.isEmpty() || owner.remote() || name.trimmed().isEmpty())
+        throw std::runtime_error("Выберите локальный раздел и введите название");
+    QSqlQuery q(db);
+    q.prepare("UPDATE sections SET title=? WHERE id=? AND project=?");
+    q.addBindValue(name.trimmed());
+    q.addBindValue(sectionId);
+    q.addBindValue(projectId);
+    run(q);
+}
+
+void Store::moveSection(const QString &projectId, const QString &sectionId, int offset)
+{
+    const auto owner = project(projectId);
+    auto ordered = sections(projectId);
+    if (owner.id.isEmpty() || owner.remote() || ordered.size() < 2)
+        return;
+    const auto selected = std::find_if(ordered.cbegin(), ordered.cend(), [&](const auto &section) {
+        return section.first == sectionId;
+    });
+    if (selected == ordered.cend())
+        return;
+    const auto from = qsizetype(selected - ordered.cbegin());
+    const auto to = qBound(qsizetype(0), from + offset, ordered.size() - 1);
+    if (from == to)
+        return;
+    ordered.move(from, to);
+    failUnless(db.transaction(), db.lastError());
+    try {
+        QSqlQuery next(db);
+        next.prepare("SELECT coalesce(max(rowid),0) FROM sections");
+        run(next);
+        if (!next.next())
+            throw std::runtime_error("Не удалось определить порядок разделов");
+        auto row = next.value(0).toLongLong();
+        next.finish();
+        QSqlQuery update(db);
+        update.prepare("UPDATE sections SET rowid=? WHERE id=? AND project=?");
+        for (const auto &section : ordered) {
+            update.bindValue(0, ++row);
+            update.bindValue(1, section.first);
+            update.bindValue(2, projectId);
+            run(update);
+        }
+        failUnless(db.commit(), db.lastError());
+    } catch (...) {
+        db.rollback();
+        throw;
+    }
 }
 
 QString Store::addProject(const QString &title)
@@ -495,7 +665,7 @@ QSqlQuery Store::query(const Filter &f) const
             terms += "t.done=1";
             break;
         case Page::Project:
-            terms += "t.done=0 AND t.project=?";
+            terms += f.showDone ? "t.project=?" : "t.done=0 AND t.project=?";
             values << f.project;
             break;
         }
@@ -504,6 +674,37 @@ QSqlQuery Store::query(const Filter &f) const
         const auto keyword = f.search.toCaseFolded();
         values << keyword << keyword << keyword;
     }
+    if (f.page == Page::Project && f.parent.isEmpty() && f.search.isEmpty()) {
+        const auto dated = QStringLiteral("coalesce(nullif(t.deadline,''),t.due)");
+        switch (f.dateFilter) {
+        case DateFilter::All: break;
+        case DateFilter::Overdue:
+            terms += dated + "<>? AND " + dated + "<?";
+            values << QStringLiteral("") << today;
+            break;
+        case DateFilter::Today:
+            terms += dated + "=?";
+            values << today;
+            break;
+        case DateFilter::Upcoming:
+            terms += dated + ">?";
+            values << today;
+            break;
+        case DateFilter::NoDate:
+            terms += dated + "=''";
+            break;
+        }
+        if (f.priorityFilter >= 0) {
+            terms += "t.priority=?";
+            values << f.priorityFilter;
+        }
+        if (!f.projectTag.isEmpty()) {
+            terms += "instr(', ' || t.tags_norm || ', ', ', ' || ? || ', ') > 0";
+            values << f.projectTag.toCaseFolded();
+        }
+    }
+    if (f.page != Page::Project && f.parent.isEmpty())
+        terms += "coalesce(o.archived,0)=0";
     if (f.section) {
         terms += "t.section=?";
         values << *f.section;
@@ -511,11 +712,13 @@ QSqlQuery Store::query(const Filter &f) const
     QString order = "coalesce(nullif(t.due,''),nullif(t.deadline,''),'9999-12-31')";
     if (f.sort == 1) order = "t.title_norm";
     if (f.sort == 2) order = "case when t.priority=0 then 4 else t.priority end";
+    if (f.sort == 3) order = "t.rowid";
     QSqlQuery q(db);
-    q.prepare("SELECT t.id,t.title,t.done,t.priority,t.due,coalesce(s.title,p.title),t.parent,t.href,t.pinned,t.deadline,"
+    q.prepare("SELECT t.id,t.title,t.done,t.priority,t.due,coalesce(s.title,o.title,p.title),t.parent,t.href,t.pinned,t.deadline,"
               " t.section,t.project FROM tasks AS t JOIN projects AS p ON p.id=t.project"
-              " LEFT JOIN sections AS s ON s.id=t.section WHERE " + terms.join(" AND ") +
-              " ORDER BY t.done ASC, t.pinned DESC, " + order + ", t.rowid");
+              " LEFT JOIN sections AS s ON s.id=t.section LEFT JOIN project_options AS o ON o.id=p.id WHERE " +
+              terms.join(" AND ") + " ORDER BY t.done ASC, t.pinned DESC, " + order +
+              (f.descending ? " DESC" : " ASC") + ", t.rowid");
     for (const auto &v : values)
         q.addBindValue(v);
     run(q);
@@ -548,7 +751,8 @@ int Store::count(Page page, bool overdueOnly) const
     default: return 0;
     }
     QSqlQuery q(db);
-    q.prepare("SELECT count(*) FROM tasks WHERE " + condition);
+    q.prepare("SELECT count(*) FROM tasks WHERE (" + condition +
+              ") AND project NOT IN (SELECT id FROM project_options WHERE archived=1)");
     if (page == Page::Today) {
         q.addBindValue(iso(QDate::currentDate()));
         q.addBindValue(iso(QDate::currentDate()));
@@ -604,7 +808,7 @@ void Store::importBackup(const QString &path)
             QSqlQuery check(db);
             bool ok = check.exec("PRAGMA snapshot.user_version");
             failUnless(ok, check.lastError());
-            if (!check.next() || ((version = check.value(0).toInt()) != 1 && version != 2))
+            if (!check.next() || ((version = check.value(0).toInt()) < 1 || version > 3))
                 throw std::runtime_error("Формат резервной копии не поддерживается");
             ok = check.exec("PRAGMA snapshot.quick_check");
             failUnless(ok, check.lastError());
@@ -617,8 +821,10 @@ void Store::importBackup(const QString &path)
             {"sections","id,project,title"},
             {"tasks","id,project,section,parent,title,notes,tags,due,deadline,priority,done,pinned,repeat,href,etag,ical,remote_uid,remote_parent_uid,title_norm,notes_norm,tags_norm"},
         };
-        if (version == 2)
+        if (version >= 2)
             tables.last().second += ",completed,attachments,reminder,task_template";
+        if (version >= 3)
+            tables.append(QPair<QString, QString>{"project_options", "id,title,notes,emoji,color,deadline,markdown,favorite,archived"});
         failUnless(db.transaction(), db.lastError());
         for (const auto &[name,columns] : tables) {
             QSqlQuery type(db);

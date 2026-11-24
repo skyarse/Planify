@@ -497,6 +497,14 @@ bool CalDav::connectAccount(const QUrl &address, const QString &user, const QStr
     return true;
 }
 
+bool CalDav::refreshAccount()
+{
+    if (active || password.isEmpty())
+        return false;
+    const auto address = origin;
+    return start(address, username, password);
+}
+
 bool CalDav::start(const QUrl &address, const QString &user, const QString &secret)
 {
     if (!connectAccount(address, user, secret))

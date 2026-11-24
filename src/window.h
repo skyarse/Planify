@@ -7,6 +7,8 @@
 #include <QMap>
 #include <QPersistentModelIndex>
 #include <QPointer>
+#include <QSet>
+#include <QThreadPool>
 #include <optional>
 
 class QAction;
@@ -46,7 +48,16 @@ private:
     bool loading = false;
     bool dirty = false;
     bool board = false;
+    bool selectingTasks = false;
     bool syncing = false;
+    struct PasswordChange {
+        QUrl address;
+        QString user;
+        QString password;
+    };
+    std::optional<PasswordChange> pendingPassword;
+    QThreadPool credentialWorker;
+    QSet<QPair<QUrl, QString>> triedCredentials;
     bool systemDark = false;
     QString theme;
     QMap<QDate, QStringList> calendarEvents;
@@ -55,6 +66,7 @@ private:
     QLineEdit *search;
     QLabel *pageTitle;
     QLabel *pageIcon;
+    QLabel *projectNote;
     QLabel *emptyTitle;
     QLabel *emptyHint;
     QPlainTextEdit *eventList;
@@ -124,6 +136,20 @@ private:
     void refreshEvents();
     void loadEvents();
     void addLocalProject();
+    void showProjectMenu(const QString &id, const QPoint &position, bool header);
+    void showViewMenu(QWidget *anchor);
+    void editProject(const Project &owner, bool deadlineOnly = false);
+    void addProjectSection(const QString &projectId);
+    void manageProjectSections(const Project &owner);
+    void chooseArchivedProject();
+    void exportProjectPdf(const Project &owner);
+    QString projectText(const Project &owner);
+    void updateProject(Project owner);
+    void updateProjectNote(const Project &owner);
+    void loadProjectView();
+    void setBoard(bool enabled);
+    void setTaskSelection(bool enabled);
+    void copySelectedTasks();
     void showPreferences();
     void refresh();
     void rebuildBoard();
@@ -146,7 +172,8 @@ private:
     void showCardField(QWidget *field);
     void showAttachments(QWidget *anchor);
     void duplicateTask();
-    bool authorize(const Project &owner, bool refreshLists = false);
+    bool authorize(const Project &owner, bool refreshLists = false, bool configure = false);
+    void saveConfirmedPassword();
     bool writeRemote(const Task &before, const Task &draft);
     void refreshAfterMutation(const QString &id);
     void checkReminders();

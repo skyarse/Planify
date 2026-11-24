@@ -15,6 +15,13 @@ struct Project {
     QString title;
     QString account;
     QString href;
+    QString notes;
+    QString emoji;
+    QString color;
+    QDate deadline;
+    int markdown = 0;
+    bool favorite = false;
+    bool archived = false;
     bool remote() const { return !account.isEmpty(); }
 };
 
@@ -51,6 +58,8 @@ struct RemoteList {
     qsizetype recovered = 0;
 };
 
+enum class DateFilter { All, Overdue, Today, Upcoming, NoDate };
+
 enum class Page { Inbox, Today, Scheduled, Pins, Labels, Completed, Project };
 
 struct Filter {
@@ -62,6 +71,10 @@ struct Filter {
     QString parent;
     int sort = 0;
     bool showDone = false;
+    bool descending = false;
+    DateFilter dateFilter = DateFilter::All;
+    int priorityFilter = -1;
+    QString projectTag;
 };
 
 class QSqlQuery;
@@ -82,6 +95,11 @@ public:
     int count(Page page, bool overdueOnly = false) const;
     void backup(const QString &path);
     void importBackup(const QString &path);
+    void saveProject(const Project &project);
+    QString duplicateProject(const QString &id);
+    void removeProject(const QString &id);
+    void renameSection(const QString &project, const QString &section, const QString &name);
+    void moveSection(const QString &project, const QString &section, int offset);
     QString addProject(const QString &title);
     QString addSection(const QString &project, const QString &title);
     QString saveTask(Task task);

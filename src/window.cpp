@@ -1,5 +1,6 @@
 #include "window.h"
 #include "appearance.h"
+#include "credentials.h"
 
 #include <QAction>
 #include <QApplication>
@@ -9,6 +10,9 @@
 #include <QClipboard>
 #include <QDesktopServices>
 #include <QFileDialog>
+#include <QFutureWatcher>
+#include <QProgressDialog>
+#include <QtConcurrentRun>
 #include <QStackedWidget>
 #include <QSaveFile>
 #include <QLocale>
@@ -383,6 +387,7 @@ private:
 
 Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
 {
+    credentialWorker.setMaxThreadCount(1);
     setWindowTitle(QStringLiteral("План задач"));
     setWindowFlag(Qt::FramelessWindowHint);
     resize(1060, 680);
@@ -436,10 +441,15 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     left->addWidget(sideHeader);
     auto *menu = new QMenu(menuButton);
     menu->addAction(QStringLiteral("Новый проект"), this, &Window::addLocalProject);
+    menu->addAction(QStringLiteral("Архив проектов…"), this, &Window::chooseArchivedProject);
     menu->addAction(QStringLiteral("Обновить из Baïkal…"), this, &Window::showSync);
     menu->addSeparator();
     auto *preferencesAction = menu->addAction(QStringLiteral("Параметры"), QKeySequence(Qt::CTRL | Qt::Key_Comma), this, &Window::showPreferences);
     addAction(preferencesAction);
+    menu->addAction(QStringLiteral("О приложении"), this, [this] {
+        QMessageBox::about(this, QStringLiteral("План задач"),
+            QStringLiteral("Сборка %1").arg(QStringLiteral(PLAN_TASKS_BUILD)));
+    });
     menu->addAction(QStringLiteral("Выйти"), QKeySequence::Quit, this, &Window::close);
     connect(menuButton, &QPushButton::clicked, this, [menuButton, menu] {
         menu->popup(menuButton->mapToGlobal(QPoint(0,menuButton->height())));
@@ -496,26 +506,15 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     auto *split = iconButton(windowHeader, Mark::Split, QStringLiteral("Показать или скрыть боковую панель"));
     controls->addWidget(split);
     controls->addStretch();
-    auto *sort = iconButton(windowHeader, Mark::Sort, QStringLiteral("Сортировка"));
-    auto *sortMenu = new QMenu(sort);
-    const QStringList sortLabels{QStringLiteral("По дате"), QStringLiteral("По названию"), QStringLiteral("По приоритету")};
-    for (int i = 0; i < sortLabels.size(); ++i)
-        sortMenu->addAction(sortLabels[i], this, [this,i] {
-            QSettings().setValue("tasks/sort", i);
-            refresh();
-        });
-    auto *more = iconButton(windowHeader, Mark::More, QStringLiteral("Действия с разделом"));
-    auto *moreMenu = new QMenu(more);
-    moreMenu->addAction(QStringLiteral("Закреплённые"), this, [this] { selectPage(Page::Pins); });
-    moreMenu->addAction(QStringLiteral("Завершённые"), this, [this] { selectPage(Page::Completed); });
-    moreMenu->addSeparator();
-    moreMenu->addAction(QStringLiteral("Параметры"), this, &Window::showPreferences);
-    for (auto entry : {qMakePair(sort,sortMenu),qMakePair(more,moreMenu)}) {
-        controls->addWidget(entry.first);
-        connect(entry.first, &QPushButton::clicked, this, [entry] {
-            entry.second->popup(entry.first->mapToGlobal(QPoint(0,entry.first->height())));
-        });
-    }
+    auto *sort = iconButton(windowHeader, Mark::Sort, QStringLiteral("Настройки просмотра"), "projectViewOptions");
+    controls->addWidget(sort);
+    connect(sort, &QPushButton::clicked, this, [this, sort] { showViewMenu(sort); });
+    auto *more = iconButton(windowHeader, Mark::More, QStringLiteral("Действия с разделом"), "projectMore");
+    controls->addWidget(more);
+    connect(more, &QPushButton::clicked, this, [this, more] {
+        showProjectMenu(filter.page == Page::Project ? filter.project : QString(),
+                        more->mapToGlobal(QPoint(0, more->height() + 5)), true);
+    });
     controls->addSpacing(18);
     auto *minimize = iconButton(windowHeader, Mark::Minus, QStringLiteral("Свернуть"), "windowControl");
     auto *maximize = iconButton(windowHeader, Mark::Maximize, QStringLiteral("Развернуть или восстановить"), "windowControl");
@@ -546,6 +545,11 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     boardButton->hide();
     toolbar->addWidget(boardButton);
     body->addLayout(toolbar);
+    projectNote = caption({}, center, "projectNote");
+    projectNote->setWordWrap(true);
+    projectNote->setContentsMargins(35, 0, 8, 4);
+    projectNote->hide();
+    body->addWidget(projectNote);
     search = new QLineEdit(center);
     search->setClearButtonEnabled(true);
     search->setPlaceholderText(QStringLiteral("Поиск по задачам"));
@@ -621,7 +625,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     eventList->setReadOnly(true);
     eventList->setMaximumHeight(125);
     eventList->hide();
-    body->insertWidget(3, eventList);
+    body->insertWidget(body->indexOf(list), eventList);
     body->addWidget(empty, 1);
 
     auto *footer = new QHBoxLayout;
@@ -882,8 +886,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     });
     connect(syncButton, &QPushButton::clicked, this, &Window::showSync);
     connect(boardButton, &QPushButton::clicked, this, [this] {
-        board = !board;
-        refresh();
+        setBoard(!board);
     });
     connect(findButton, &QPushButton::clicked, this, [this] {
         if (search->isVisible()) {
@@ -936,27 +939,18 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         if (item->data(Qt::UserRole).toString().isEmpty())
             showSync();
     });
-    connect(addSection, &QPushButton::clicked, this, [this] {
-        bool ok;
-        const auto name = QInputDialog::getText(this, QStringLiteral("Новая секция"), QStringLiteral("Название"),
-            QLineEdit::Normal, {}, &ok);
-        if (!ok)
-            return;
-        try {
-            store.addSection(filter.project, name);
-            if (editor->isVisible() && project->currentData().toString() == filter.project) {
-                const auto selection = section->currentData().toString();
-                loading = true;
-                reloadSections(filter.project, selection);
-                loading = false;
-            }
-            refresh();
-        } catch (const std::exception &error) {
-            message(QString::fromUtf8(error.what()));
+    connect(addSection, &QPushButton::clicked, this, [this] { addProjectSection(filter.project); });
+    projects->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(projects, &QListWidget::customContextMenuRequested, this, [this](const QPoint &point) {
+        if (const auto *row = projects->itemAt(point)) {
+            const auto id = row->data(Qt::UserRole).toString();
+            if (!id.isEmpty())
+                showProjectMenu(id, projects->viewport()->mapToGlobal(point), false);
         }
     });
     connect(&caldav, &CalDav::progress, this, [this](const QString &text) { status->setText(text); });
     connect(&caldav, &CalDav::failed, this, [this](const QString &error) {
+        pendingPassword.reset();
         writing = false;
         writingId.clear();
         updateCardActions();
@@ -965,6 +959,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         message(error);
     });
     connect(&caldav, &CalDav::created, this, [this](const Task &created) {
+        saveConfirmedPassword();
         writing = false;
         writingId.clear();
         syncButton->setEnabled(true);
@@ -977,6 +972,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         }
     });
     connect(&caldav, &CalDav::updated, this, [this](const Task &previous, const Task &updated) {
+        saveConfirmedPassword();
         writing = false;
         writingId.clear();
         syncButton->setEnabled(true);
@@ -992,6 +988,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         updateCardActions();
     });
     connect(&caldav, &CalDav::imported, this, [this](const QList<RemoteList> &lists) {
+        saveConfirmedPassword();
         syncing = false;
         syncButton->setEnabled(true);
         try {
@@ -1120,7 +1117,7 @@ void Window::setTheme(const QString &option)
         QLabel#pageTitle { font-size: 19px; padding: 2px 0; }
         QLabel#emptyTitle { font-size: 25px; font-weight: bold; }
         QLabel#emptyHint { font-size: 14px; }
-        QLabel#muted { color: %6; }
+        QLabel#muted, QLabel#projectNote { color: %6; }
         QPushButton#tool { background: transparent; border: 0; border-radius: 6px; min-width: 30px; min-height: 29px; font-size: 17px; }
         QPushButton#tool:hover, QPushButton#secondary:hover, QPushButton#sync:hover { background: %5; }
         QPushButton#secondary, QPushButton#sync { padding: 6px 9px; border-radius: 6px; border: 1px solid %4; }
@@ -1209,10 +1206,12 @@ void Window::selectPage(Page page, const QString &id)
     if (!mayDiscard())
         return;
     closeCard();
+    setTaskSelection(false);
     filter = Filter{page, id, {}, {}, {}, {}};
     search->clear();
     search->hide();
     board = false;
+    loadProjectView();
     for (int i = 0; i < navigation.size(); ++i)
         navigation[i]->setChecked(items[i].page == page);
     projects->clearSelection();
@@ -1236,7 +1235,8 @@ void Window::refreshNavigation()
     const bool showLocal = QSettings().value("sidebar/local", true).toBool();
     const auto entries = store.projects();
     for (const auto &entry : entries) {
-        if (!entry.remote() && !showLocal)
+        hasRemote |= entry.remote();
+        if ((!entry.remote() && !showLocal) || entry.archived)
             continue;
         if (entry.remote() && group != entry.account) {
             group = entry.account;
@@ -1245,11 +1245,14 @@ void Window::refreshNavigation()
             header->setToolTip(QStringLiteral("Обновить локальную копию из Baïkal"));
         }
         hasLocal |= !entry.remote();
-        hasRemote |= entry.remote();
         auto name = entry.title;
         auto *item = new QListWidgetItem(name, projects);
+        if (!entry.emoji.isEmpty())
+            item->setData(Qt::UserRole + 2, entry.emoji);
+        else if (entry.favorite)
+            item->setData(Qt::UserRole + 2, QStringLiteral("★"));
         const auto first = name.toUcs4().value(0);
-        if (first >= 0x1F000 || (first >= 0x2300 && first <= 0x27BF)) {
+        if (entry.emoji.isEmpty() && (first >= 0x1F000 || (first >= 0x2300 && first <= 0x27BF))) {
             QTextBoundaryFinder grapheme(QTextBoundaryFinder::Grapheme, name);
             const auto boundary = grapheme.toNextBoundary();
             if (boundary > 0 && boundary < name.size() && name.at(boundary).isSpace()) {
@@ -1259,6 +1262,7 @@ void Window::refreshNavigation()
         }
         item->setData(Qt::UserRole, entry.id);
         item->setToolTip(entry.title);
+        item->setData(Qt::UserRole + 3, entry.favorite);
         if (entry.id == selected)
             projects->setCurrentItem(item);
     }
@@ -1297,10 +1301,16 @@ void Window::refresh()
     try {
         const auto selected = store.project(filter.project);
         const QSettings settings;
-        filter.sort = settings.value("tasks/sort", 0).toInt();
-        filter.showDone = settings.value("tasks/showDoneToday", false).toBool();
+        if (filter.page != Page::Project) {
+            filter.sort = settings.value("tasks/sort", 0).toInt();
+            filter.showDone = settings.value("tasks/showDoneToday", false).toBool();
+        }
         refreshEvents();
         const bool projectPage = filter.page == Page::Project && filter.search.isEmpty();
+        if (projectPage)
+            updateProjectNote(selected);
+        else
+            projectNote->hide();
         labels->setVisible(filter.page == Page::Labels && filter.search.isEmpty());
         addSection->setVisible(projectPage && !selected.remote());
         boardButton->setVisible(projectPage);
@@ -1311,7 +1321,9 @@ void Window::refresh()
             mark = Mark::Search;
             pageTitle->setText(QStringLiteral("Результаты поиска"));
         } else if (projectPage) {
-            pageTitle->setText(selected.title);
+            pageTitle->setText(selected.emoji.isEmpty() ? selected.title : selected.emoji + ' ' + selected.title);
+            if (QColor(selected.color).isValid())
+                color = QColor(selected.color);
         } else {
             for (const auto &item : items)
                 if (filter.page == item.page) {
@@ -1383,6 +1395,8 @@ void Window::rebuildBoard()
 QListView *Window::createTaskList(QWidget *parent, QSqlQueryModel *taskModel)
 {
     const auto completeTask = [this](const QString &id) {
+        if (selectingTasks)
+            return;
         QTimer::singleShot(0, this, [this, id] { toggleTask(id); });
     };
     auto *view = new TaskView(completeTask, parent);
@@ -1393,9 +1407,12 @@ QListView *Window::createTaskList(QWidget *parent, QSqlQueryModel *taskModel)
     view->setMouseTracking(true);
     view->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    view->setSelectionMode(selectingTasks ? QAbstractItemView::ExtendedSelection : QAbstractItemView::SingleSelection);
     view->setEditTriggers(QAbstractItemView::NoEditTriggers);
     view->setItemDelegate(new TaskDelegate(view));
     const auto activate = [this](const QModelIndex &idx) {
+        if (selectingTasks)
+            return;
         const auto id = idx.data().toString();
         QTimer::singleShot(0, this, [this, id] { openTask(id); });
     };
@@ -1453,7 +1470,7 @@ void Window::editTask(const Task &task)
     project->clear();
     project->addItem(QStringLiteral("Входящие"), Store::inbox());
     for (const auto &p : store.projects())
-        if (task.id.isEmpty() || !p.remote() || p.id == task.project)
+        if ((!p.archived || p.id == task.project) && (task.id.isEmpty() || !p.remote() || p.id == task.project))
             project->addItem(p.title, p.id);
     selectData(project, task.project);
     reloadSections(task.project, task.section);
@@ -1692,6 +1709,8 @@ void Window::chooseDestination()
     add(QStringLiteral("Входящие"), Store::inbox(), {}, Mark::Inbox);
     QString lastGroup;
     for (const auto &owner : store.projects()) {
+        if (owner.archived && owner.id != project->currentData().toString())
+            continue;
         const auto group = owner.remote() ? owner.account : QStringLiteral("На этом компьютере");
         if (group != lastGroup) {
             auto *heading = new QListWidgetItem(group, choices);
@@ -2078,28 +2097,68 @@ void Window::showSync()
 {
     if (syncing || writing)
         return;
+    if (caldav.refreshAccount()) {
+        syncing = true;
+        syncButton->setEnabled(false);
+        return;
+    }
     authorize({}, true);
 }
 
-bool Window::authorize(const Project &owner, bool refreshLists)
+bool Window::authorize(const Project &owner, bool refreshLists, bool configure)
 {
-    QDialog dialog(composer->isVisible() ? composer : static_cast<QWidget *>(this));
+    auto *parent = composer->isVisible() ? static_cast<QWidget *>(composer) : static_cast<QWidget *>(this);
+    const QSettings settings;
+    const auto savedAddress = QUrl(settings.value("dav/address").toString(), QUrl::StrictMode);
+    const auto savedLogin = settings.value("dav/user").toString();
+    const auto start = [&](const QUrl &url, const QString &user, const QString &password) {
+        if (!refreshLists)
+            return caldav.connectAccount(url, user, password) && caldav.connected(owner);
+        syncing = caldav.start(url, user, password);
+        syncButton->setEnabled(!syncing);
+        return syncing;
+    };
+    const auto savedAccount = qMakePair(savedAddress, savedLogin);
+    if (!configure && settings.value("dav/remember", true).toBool() && savedAddress.isValid() &&
+        !savedLogin.isEmpty() && !triedCredentials.contains(savedAccount)) {
+        triedCredentials.insert(savedAccount);
+        QProgressDialog waiting(QStringLiteral("Читаю пароль из системного хранилища…"),
+            QStringLiteral("Отмена"), 0, 0, parent);
+        waiting.setWindowModality(Qt::WindowModal);
+        waiting.setMinimumDuration(0);
+        waiting.show();
+        QEventLoop loop;
+        QFutureWatcher<QString> lookup;
+        connect(&lookup, &QFutureWatcher<QString>::finished, &loop, &QEventLoop::quit);
+        connect(&waiting, &QProgressDialog::canceled, &loop, &QEventLoop::quit);
+        lookup.setFuture(QtConcurrent::run(&credentialWorker, [savedAddress, savedLogin] {
+            return Credentials::lookup(savedAddress, savedLogin);
+        }));
+        if (!lookup.isFinished())
+            loop.exec();
+        if (waiting.wasCanceled())
+            return false;
+        const auto secret = lookup.result();
+        if (!secret.isEmpty() && start(savedAddress, savedLogin, secret))
+            return true;
+    }
+    QDialog dialog(parent);
     dialog.setWindowTitle(refreshLists ? QStringLiteral("Baïkal") : QStringLiteral("Подключение к Baïkal"));
     auto *layout = new QFormLayout(&dialog);
-    auto *help = new QLabel(refreshLists
-        ? QStringLiteral("Загрузить списки и задачи. Пароль действует до закрытия приложения.")
-        : QStringLiteral("Для записи в Baïkal введите пароль учётной записи. Он действует до закрытия приложения."), &dialog);
+    auto *help = new QLabel(QStringLiteral("Пароль можно сохранить в системном хранилище."), &dialog);
     help->setWordWrap(true);
     layout->addRow(help);
-    const QSettings settings;
-    auto *address = new QLineEdit(settings.value("dav/address").toString(), &dialog);
+    auto *address = new QLineEdit(savedAddress.toDisplayString(), &dialog);
     address->setPlaceholderText(QStringLiteral("https://…/dav.php"));
-    auto *login = new QLineEdit(settings.value("dav/user").toString(), &dialog);
+    auto *login = new QLineEdit(savedLogin, &dialog);
     auto *passwordInput = new QLineEdit(&dialog);
     passwordInput->setEchoMode(QLineEdit::Password);
+    auto *remember = new QCheckBox(QStringLiteral("Запомнить пароль"), &dialog);
+    remember->setChecked(settings.value("dav/remember", true).toBool());
     layout->addRow(QStringLiteral("Адрес"), address);
     layout->addRow(QStringLiteral("Логин"), login);
     layout->addRow(QStringLiteral("Пароль"), passwordInput);
+    layout->addRow(remember);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     buttons->button(QDialogButtonBox::Ok)->setText(refreshLists ? QStringLiteral("Обновить") : QStringLiteral("Подключить"));
     layout->addRow(buttons);
@@ -2109,23 +2168,38 @@ bool Window::authorize(const Project &owner, bool refreshLists)
     passwordInput->setFocus();
     if (dialog.exec() != QDialog::Accepted)
         return false;
-    const auto url = QUrl(address->text().trimmed(), QUrl::StrictMode);
+    const QUrl url(address->text().trimmed(), QUrl::StrictMode);
     const auto user = login->text().trimmed();
     const auto password = passwordInput->text();
     passwordInput->clear();
-    if (refreshLists) {
-        syncing = caldav.start(url, user, password);
-        syncButton->setEnabled(!syncing);
-        if (!syncing)
-            return false;
-    } else if (!caldav.connectAccount(url, user, password) || !caldav.connected(owner)) {
-        message(QStringLiteral("Адрес и логин должны соответствовать списку Baïkal"));
+    if (!start(url, user, password)) {
+        if (!refreshLists)
+            message(QStringLiteral("Адрес и логин должны соответствовать списку Baïkal"));
         return false;
     }
+    triedCredentials.insert(qMakePair(url, user));
+    pendingPassword = PasswordChange{url, user, remember->isChecked() ? password : QString()};
     QSettings saved;
-    saved.setValue("dav/address", url.toString());
+    saved.setValue("dav/address", url.toString(QUrl::FullyEncoded));
     saved.setValue("dav/user", user);
+    saved.setValue("dav/remember", remember->isChecked());
     return true;
+}
+
+void Window::saveConfirmedPassword()
+{
+    if (!pendingPassword)
+        return;
+    auto *operation = new QFutureWatcher<bool>(this);
+    connect(operation, &QFutureWatcher<bool>::finished, this, [this, operation] {
+        if (!operation->result())
+            message(QStringLiteral("Системное хранилище не смогло сохранить или удалить пароль Baïkal"));
+        operation->deleteLater();
+    });
+    operation->setFuture(QtConcurrent::run(&credentialWorker, [change = std::move(*pendingPassword)] {
+        return Credentials::store(change.address, change.user, change.password);
+    }));
+    pendingPassword.reset();
 }
 
 void Window::message(const QString &text)
@@ -2228,6 +2302,28 @@ bool Window::smokeTest()
     QMetaObject::invokeMethod(title, "returnPressed");
     if (composer->isVisible() || composerShade->isVisible() || filter.project != sample || model->rowCount() != 1 ||
         store.task(model->index(0, 0).data().toString()).section != sampleSection)
+        return false;
+    const auto point = projects->visualItemRect(projects->currentItem()).center();
+    QMetaObject::invokeMethod(projects, "customContextMenuRequested", Q_ARG(QPoint, point));
+    auto *projectMenu = findChild<QMenu *>("projectActions");
+    if (!projectMenu || !projectMenu->isVisible() || projectMenu->actions().size() < 6)
+        return false;
+    projectMenu->actions().first()->trigger();
+    projectMenu->close();
+    if (!store.project(sample).favorite)
+        return false;
+    auto *viewOptions = findChild<QPushButton *>("projectViewOptions");
+    if (!viewOptions)
+        return false;
+    viewOptions->click();
+    auto *viewMenu = viewOptions->findChild<QMenu *>("projectViewMenu");
+    if (!viewMenu || !viewMenu->isVisible())
+        return false;
+    for (auto *check : viewMenu->findChildren<QCheckBox *>())
+        if (check->text() == QStringLiteral("Показать завершённые"))
+            check->click();
+    viewMenu->close();
+    if (!filter.showDone)
         return false;
     board = true;
     refresh();

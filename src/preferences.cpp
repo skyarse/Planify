@@ -254,7 +254,7 @@ QDialog *Window::makePreferences()
     info(0, account.isEmpty() ? QStringLiteral("Подключите Baïkal, чтобы загрузить и обновлять списки задач.")
         : QStringLiteral("%1\n%2\nЛокальная копия задач доступна без интернета.").arg(account,address));
     action(0, account.isEmpty() ? QStringLiteral("Подключить Baïkal…") : QStringLiteral("Настроить и обновить Baïkal…"),
-        [this,dialog] { dialog->accept(); showSync(); });
+        [this,dialog] { dialog->accept(); if (!syncing && !writing) authorize({}, true, true); });
 
     combo(1,QStringLiteral("При запуске"),{QStringLiteral("Входящие"),QStringLiteral("Сегодня"),QStringLiteral("Предстоящие"),
           QStringLiteral("Метки"),QStringLiteral("Закреплённые"),QStringLiteral("Завершённые")},

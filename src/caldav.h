@@ -16,6 +16,7 @@ public:
     bool update(const Project &project, const Task &previous, const Task &draft);
     static void populateDetails(Task &task);
     static QByteArray exportTask(const Task &task);
+    bool refreshAccount();
     bool start(const QUrl &address, const QString &username, const QString &password);
 
 signals:

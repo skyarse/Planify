@@ -554,6 +554,69 @@ void remoteCreation(const QString &path)
            "new request and confirmation did not persist a second task");
 }
 
+
+void projectControls(const QTemporaryDir &root)
+{
+    Store store(root.filePath("project-controls.sqlite"));
+    const auto id = store.addProject("Original project");
+    auto details = store.project(id);
+    details.title = "Renamed project";
+    details.notes = "Project note";
+    details.emoji = "🧪";
+    details.deadline = QDate::currentDate().addDays(5);
+    details.favorite = true;
+    details.markdown = 1;
+    store.saveProject(details);
+    const auto first = store.addSection(id, "First");
+    const auto second = store.addSection(id, "Second");
+    store.moveSection(id, first, 1);
+    store.renameSection(id, second, "Renamed section");
+    expect(store.sections(id).first() == qMakePair(second, QString("Renamed section")),
+           "section order or title was not saved");
+    Task task;
+    task.project = id;
+    task.section = first;
+    task.title = "Parent due today";
+    task.priority = 1;
+    task.tags = "Alpha, beta";
+    task.due = QDate::currentDate();
+    const auto parent = store.saveTask(task);
+    task.parent = parent;
+    task.title = "Child without a date";
+    task.due = {};
+    task.tags = "alpha";
+    task.priority = 2;
+    const auto child = store.saveTask(task);
+    store.toggle(child);
+    Filter filter;
+    filter.page = Page::Project;
+    filter.project = id;
+    filter.showDone = true;
+    filter.dateFilter = DateFilter::NoDate;
+    filter.priorityFilter = 2;
+    filter.projectTag = "ALPHA";
+    expect(ids(store.query(filter)) == QStringList{child}, "filters did not intersect correctly");
+    filter.showDone = false;
+    expect(ids(store.query(filter)).isEmpty(), "completed filtering was ignored");
+    const auto copy = store.duplicateProject(id);
+    filter = Filter{.page = Page::Project, .project = copy, .showDone = true};
+    const auto tasks = ids(store.query(filter));
+    expect(tasks.size() == 2 && tasks.first() != parent && store.task(tasks.last()).parent == tasks.first() &&
+           store.task(tasks.last()).done && store.sections(copy).size() == 2, "duplication lost project structure");
+    details.archived = true;
+    store.saveProject(details);
+    expect(store.project(id).archived && store.count(Page::Today) == 1, "archived project's tasks stayed in Today");
+    const auto snapshot = root.filePath("project-controls-backup.sqlite");
+    store.backup(snapshot);
+    Store restored(root.filePath("project-controls-restored.sqlite"));
+    restored.importBackup(snapshot);
+    const auto verified = restored.project(id);
+    expect(verified.title == details.title && verified.notes == details.notes && verified.deadline == details.deadline &&
+           verified.favorite && verified.archived && verified.markdown == 1, "backup lost project details");
+    store.removeProject(copy);
+    expect(store.project(copy).id.isEmpty() && store.task(parent).id == parent, "copy removal modified original tasks");
+}
+
 }
 
 int main(int argc, char **argv)
@@ -567,6 +630,7 @@ int main(int argc, char **argv)
         remoteWrites(root.filePath("remote-writes.sqlite"));
         remoteCreation(root.filePath("remote-creation.sqlite"));
         backupTasks(root);
+        projectControls(root);
         return 0;
     } catch (const std::exception &error) {
         qCritical("%s", error.what());
