@@ -1,0 +1,41 @@
+name: Android
+
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build and verify the development APK
+        env:
+          ANDROID_DEBUG_KEYSTORE: ${{ runner.temp }}/plan-tasks-dev.keystore
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+          android/test.sh
+          android/build.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: plan-tasks-android-ci
+          path: android/build/plan-tasks-android-dev.apk
+          if-no-files-found: error
