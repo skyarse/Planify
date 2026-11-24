@@ -71,6 +71,9 @@ private:
     QPushButton *completion;
     QPushButton *completedDate;
     QPushButton *dateButton;
+    QPushButton *composerDate;
+    QPushButton *closeEditor;
+    QWidget *composerDivider;
     QPushButton *priorityButton;
     QPushButton *reminderButton;
     QDateTimeEdit *reminder;
@@ -86,6 +89,8 @@ private:
     QHBoxLayout *cardToolbar;
     QPushButton *destination;
     QLabel *composerStatus;
+    QLabel *composerHeading;
+    QWidget *composerShade;
     QString creationToken;
     QWidget *parking;
     QPointer<QListView> expandedView;
@@ -136,6 +141,7 @@ private:
     void unmountCard();
     void closeCard();
     void resizeCard();
+    void fitComposer();
     void updateCardActions();
     void showCardField(QWidget *field);
     void showAttachments(QWidget *anchor);

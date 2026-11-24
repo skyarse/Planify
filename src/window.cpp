@@ -309,8 +309,9 @@ public:
     TaskDialog(QWidget *parent, std::function<void()> cancel)
         : QDialog(parent), cancel(std::move(cancel))
     {
+        setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
         setWindowModality(Qt::WindowModal);
-        setWindowFlags(Qt::Dialog | Qt::CustomizeWindowHint | Qt::WindowTitleHint | Qt::WindowCloseButtonHint);
+        setAttribute(Qt::WA_TranslucentBackground);
     }
 
     void reject() override { cancel(); }
@@ -393,6 +394,10 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
 
     frame = new QWidget(this);
     frame->setObjectName("frame");
+    composerShade = new QWidget(frame);
+    composerShade->setObjectName("composerShade");
+    composerShade->setAttribute(Qt::WA_TransparentForMouseEvents);
+    composerShade->hide();
     frame->installEventFilter(this);
     setCentralWidget(frame);
     auto *frameLayout = new QHBoxLayout(frame);
@@ -550,15 +555,29 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
 
     composer = new TaskDialog(this, [this] { if (mayDiscard()) closeCard(); });
     composer->setObjectName("taskComposer");
-    auto *composeLayout = new QVBoxLayout(composer);
-    composeLayout->setContentsMargins(14, 12, 14, 12);
+    auto *composeOuter = new QVBoxLayout(composer);
+    composeOuter->setContentsMargins(0, 0, 0, 0);
+    composeOuter->setSizeConstraint(QLayout::SetNoConstraint);
+    auto *panel = new QWidget(composer);
+    panel->setObjectName("composerPanel");
+    composeOuter->addWidget(panel);
+    auto *composeLayout = new QVBoxLayout(panel);
+    composeLayout->setContentsMargins(15, 12, 15, 14);
     composeLayout->setSpacing(9);
+    auto *composerHeader = new QHBoxLayout;
+    composerHeading = caption(QStringLiteral("Новая задача"), panel, "composerHeading");
+    composerHeader->addWidget(composerHeading, 1);
+    auto *closeComposer = iconButton(panel, Mark::Close, QStringLiteral("Закрыть диалог"));
+    closeComposer->setAutoDefault(false);
+    connect(closeComposer, &QPushButton::clicked, composer, &QDialog::reject);
+    composerHeader->addWidget(closeComposer);
+    composeLayout->addLayout(composerHeader);
     composerStatus = caption({}, composer, "composerStatus");
     composerStatus->setWordWrap(true);
     composerStatus->hide();
     composeLayout->addWidget(composerStatus);
     composerFooter = new QHBoxLayout;
-    destination = button({}, composer, "destination");
+    destination = button({}, panel, "destination");
     destination->setAccessibleName(QStringLiteral("Выбрать список или проект"));
     destination->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
     destination->setMaximumWidth(330);
@@ -632,9 +651,14 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     header->addWidget(title, 1);
     pinned = new QCheckBox(QStringLiteral("Закрепить"), editor);
     header->addWidget(pinned);
-    auto *closeEditor = iconButton(editor, Mark::Close, QStringLiteral("Свернуть карточку"));
+    closeEditor = iconButton(editor, Mark::Close, QStringLiteral("Свернуть карточку"));
     header->addWidget(closeEditor);
     details->addLayout(header);
+    composerDivider = new QWidget(editor);
+    composerDivider->setObjectName("composerDivider");
+    composerDivider->setFixedHeight(1);
+    composerDivider->hide();
+    details->addWidget(composerDivider);
 
     notes = new QPlainTextEdit(editor);
     notes->setObjectName("inlineNotes");
@@ -648,6 +672,10 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     actions->setSpacing(3);
     dateButton = iconButton(editor, Mark::Calendar, QStringLiteral("Дата"));
     actions->addWidget(dateButton);
+    composerDate = button(QStringLiteral("Дата"), editor, "composerDate");
+    composerDate->setAutoDefault(false);
+    composerDate->hide();
+    actions->addWidget(composerDate);
     actions->addStretch();
     auto *attachments = iconButton(editor, Mark::Attachment, QStringLiteral("Вложения"));
     auto *labelButton = iconButton(editor, Mark::Tag, QStringLiteral("Метки"));
@@ -691,7 +719,12 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     connect(taskMenuButton, &QPushButton::clicked, this, [taskMenuButton, taskMenu] {
         taskMenu->popup(taskMenuButton->mapToGlobal(QPoint(0, taskMenuButton->height())));
     });
-    connect(taskMenu, &QMenu::aboutToShow, this, [this, deleteAction, historyAction] {
+    const auto existingActions = taskMenu->actions();
+    connect(taskMenu, &QMenu::aboutToShow, this, [this, deleteAction, historyAction, existingActions] {
+        const bool creating = current.id.isEmpty();
+        for (auto *action : existingActions)
+            action->setVisible(!creating || action == templateAction || action == moveAction);
+        moveAction->setText(creating ? QStringLiteral("Секция и повтор") : QStringLiteral("Переместить"));
         deleteAction->setEnabled(!current.remote() && !current.id.isEmpty());
         historyAction->setText(completedDate->toolTip());
     });
@@ -773,6 +806,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
             showCardField(page);
         });
     }
+    connect(composerDate, &QPushButton::clicked, this, [this, page = dates->parentWidget()] { showCardField(page); });
     connect(moveAction, &QAction::triggered, this, [this, page = placement->parentWidget()] { showCardField(page); });
     connect(attachments, &QPushButton::clicked, this, [this, attachments] { showAttachments(attachments); });
     connect(completedDate, &QPushButton::clicked, this, [this] {
@@ -1040,7 +1074,14 @@ void Window::setTheme(const QString &option)
     auto css = QStringLiteral(R"CSS(
         QLabel, QCheckBox, QListWidget#projects, QPushButton { color: %2; }
         QWidget#frame, QWidget#windowRoot, QDialog#preferences, QWidget#settingsPage { background: %1; color: %2; }
-        QDialog#taskComposer { background: %1; }
+        QDialog#taskComposer { background: transparent; }
+        QWidget#composerShade { background: rgba(18, 24, 34, 64); }
+        QWidget#composerPanel { background: %1; border: 1px solid %4; border-radius: 14px; }
+        QLabel#composerHeading { font-size: 15px; font-weight: 650; }
+        QWidget#composerDivider { background: %4; }
+        QPushButton#composerDate { padding: 4px 7px; background: transparent; border: 0;
+            border-radius: 6px; font-weight: 600; }
+        QPushButton#composerDate:hover, QPushButton#composerDate:focus { background: %5; }
         QPushButton#destination { padding: 7px 10px; border: 1px solid %4; border-radius: 8px;
             background: %7; text-align: left; font-weight: 600; }
         QPushButton#destination:hover { background: %5; }
@@ -1104,6 +1145,8 @@ void Window::setTheme(const QString &option)
 
 bool Window::eventFilter(QObject *object, QEvent *event)
 {
+    if (object == frame && event->type() == QEvent::Resize)
+        composerShade->setGeometry(frame->rect());
     if (event->type() != QEvent::MouseButtonPress && event->type() != QEvent::MouseButtonDblClick)
         return QMainWindow::eventFilter(object, event);
     auto *mouse = static_cast<QMouseEvent *>(event);
@@ -1302,7 +1345,7 @@ void Window::refresh()
         emptyHint->setVisible(filter.search.isEmpty());
         const auto action = !quickShortcut->isEnabled() ? QStringLiteral("Ctrl+N") : quickShortcut->key().toString();
         emptyHint->setText(QStringLiteral("Нажмите клавишу «%1», чтобы создать новую задачу").arg(action.toLower()));
-        empty->setVisible(!showBoard && model->rowCount() == 0 && !cardOpen);
+        empty->setVisible(!showBoard && model->rowCount() == 0);
         mountCard();
     } catch (const std::exception &error) {
         message(QString::fromUtf8(error.what()));
@@ -1440,11 +1483,12 @@ void Window::editTask(const Task &task)
 void Window::unmountCard()
 {
     editor->hide();
-    if (save->parentWidget() == composer)
+    if (composerFooter->indexOf(save) != -1)
         cardToolbar->addWidget(save);
     save->setVisible(current.repeat != "remote");
     editor->setParent(parking);
     composer->hide();
+    composerShade->hide();
     if (expandedView && expandedIndex.isValid()) {
         auto *delegate = static_cast<TaskDelegate *>(expandedView->itemDelegate());
         delegate->expandedId.clear();
@@ -1459,7 +1503,13 @@ void Window::mountCard()
 {
     if (!cardOpen)
         return;
-    if (!current.id.isEmpty()) {
+    const bool creating = current.id.isEmpty();
+    composerDate->setVisible(creating);
+    composerDivider->setVisible(creating);
+    dateButton->setVisible(!creating);
+    completedDate->setVisible(!creating);
+    closeEditor->setVisible(!creating);
+    if (!creating) {
         const auto views = boardArea->isVisible() ? boardViews : QList<QListView *>{list};
         for (auto *view : views) {
             auto *tasks = view->model();
@@ -1482,25 +1532,40 @@ void Window::mountCard()
             }
         }
     }
-    const bool creating = current.id.isEmpty();
-    static_cast<QVBoxLayout *>(composer->layout())->insertWidget(0, editor);
+    auto *composeLayout = static_cast<QVBoxLayout *>(composerHeading->parentWidget()->layout());
+    composeLayout->insertWidget(1, editor);
     destination->setVisible(creating);
-    composer->setWindowTitle(creating ? (current.parent.isEmpty() ? QStringLiteral("Новая задача")
-        : QStringLiteral("Новая подзадача")) : QStringLiteral("Задача"));
+    const auto heading = creating ? (current.parent.isEmpty() ? QStringLiteral("Новая задача")
+        : QStringLiteral("Новая подзадача")) : QStringLiteral("Задача");
+    composerHeading->setText(heading);
+    composer->setWindowTitle(heading);
+    closeEditor->hide();
     if (creating) {
         composerFooter->addWidget(save);
-        save->setText(QStringLiteral("Создать"));
         save->show();
         updateDestination();
     }
     for (auto *button : editor->findChildren<QPushButton *>())
         button->setAutoDefault(false);
     editor->show();
-    composer->setFixedWidth(qBound(410, width() * 2 / 3, 600));
-    composer->adjustSize();
+    composer->setFixedWidth(qBound(410, width() * 3 / 5, 560));
+    fitComposer();
+    composerShade->setGeometry(frame->rect());
+    composerShade->raise();
+    composerShade->show();
     composer->show();
     if (creating)
         title->setFocus();
+}
+
+void Window::fitComposer()
+{
+    editor->layout()->invalidate();
+    auto *layout = composerHeading->parentWidget()->layout();
+    layout->invalidate();
+    const int height = layout->hasHeightForWidth() ? layout->totalHeightForWidth(composer->width())
+                                                  : layout->sizeHint().height();
+    composer->setFixedHeight(qMax(height, layout->minimumSize().height()));
 }
 
 void Window::closeCard()
@@ -1520,7 +1585,7 @@ void Window::resizeCard()
         delegate->expandedHeight = editor->sizeHint().height() + 4;
         expandedView->doItemsLayout();
     } else if (composer->isVisible()) {
-        composer->adjustSize();
+        fitComposer();
     }
 }
 
@@ -1544,8 +1609,13 @@ void Window::updateCardActions()
     save->setVisible(current.repeat != "remote");
     save->setText(current.id.isEmpty() ? QStringLiteral("Создать") : QStringLiteral("Сохранить"));
     save->setEnabled(!writing && (dirty || current.id.isEmpty()));
-    dateButton->setToolTip(due->date() == noDate ? QStringLiteral("Дата") :
-        QStringLiteral("Дата · %1").arg(QLocale().toString(due->date(), QLocale::ShortFormat)));
+    const auto date = due->date() == noDate ? QStringLiteral("Дата") : QLocale().toString(due->date(), QLocale::ShortFormat);
+    dateButton->setToolTip(due->date() == noDate ? date : QStringLiteral("Дата · %1").arg(date));
+    composerDate->setIcon(markIcon(Mark::Calendar, ink));
+    composerDate->setText(date);
+    composerDate->setAccessibleName(QStringLiteral("Выбрать дату"));
+    if (composer->isVisible())
+        fitComposer();
     priorityButton->setToolTip(QStringLiteral("Приоритет · %1").arg(priority->currentText()));
     reminderButton->setToolTip(reminder->dateTime().date() == noDate ? QStringLiteral("Напоминание") :
         QStringLiteral("Напоминание · %1").arg(QLocale().toString(reminder->dateTime(), QLocale::ShortFormat)));
@@ -1581,9 +1651,10 @@ void Window::updateDestination()
     const bool remote = owner.remote();
     destination->setIcon(markIcon(owner.id == Store::inbox() ? Mark::Inbox : remote ? Mark::Cloud : Mark::Project,
         palette().color(QPalette::WindowText)));
-    destination->setText(QFontMetrics(destination->font()).elidedText(project->currentText(), Qt::ElideRight, 268)
+    const auto label = remote ? QStringLiteral("%1 · Baïkal").arg(project->currentText()) : project->currentText();
+    destination->setText(QFontMetrics(destination->font()).elidedText(label, Qt::ElideRight, 268)
                          + QStringLiteral("  ▾"));
-    destination->setToolTip(project->currentText());
+    destination->setToolTip(label);
     section->setEnabled(!remote);
     repeat->setEnabled(!remote);
     if (remote)
@@ -1976,7 +2047,8 @@ bool Window::mayDiscard()
         return false;
     if (!dirty)
         return true;
-    const auto answer = QMessageBox::question(this, QStringLiteral("Сохранить изменения?"),
+    auto *parent = composer->isVisible() ? static_cast<QWidget *>(composer) : static_cast<QWidget *>(this);
+    const auto answer = QMessageBox::question(parent, QStringLiteral("Сохранить изменения?"),
         QStringLiteral("Изменения в карточке ещё не сохранены."),
         QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel,
         QMessageBox::Save);
@@ -2062,7 +2134,7 @@ void Window::message(const QString &text)
     if (composer->isVisible()) {
         composerStatus->setText(text);
         composerStatus->setVisible(!text.isEmpty());
-        composer->adjustSize();
+        fitComposer();
     }
 }
 
@@ -2109,12 +2181,37 @@ bool Window::smokeTest()
     const auto sample = store.addProject(QStringLiteral("Тестовый проект"));
     const auto sampleSection = store.addSection(sample, QStringLiteral("Испытание доски"));
     constexpr auto remoteProject = "remote-example";
-    store.importReadOnly({RemoteList{Project{remoteProject, QStringLiteral("Список Baïkal для проверки"),
+    store.importReadOnly({RemoteList{Project{remoteProject, QStringLiteral("Входящие"),
         "tester@example.org", "https://example.org/tasks/"}, {}}});
     selectPage(Page::Project, remoteProject);
-    newTask();
-    if (!composer->isVisible() || project->currentData().toString() != remoteProject)
+    resize(1300, 850);
+    QApplication::processEvents();
+    const auto listGeometry = list->geometry();
+    auto *addControl = findChild<QPushButton *>("addTask");
+    if (!addControl)
         return false;
+    addControl->click();
+    QApplication::processEvents();
+    if (!composer->isVisible() || !composerShade->isVisible() || !composer->isWindow() ||
+        composer->windowModality() != Qt::WindowModal ||
+        editor->window() != composer || !destination->isVisible() || !composerDate->isVisible() ||
+        !save->isVisible() || save->text() != QStringLiteral("Создать") ||
+        composer->width() > 560 || composer->height() > 290 ||
+        list->geometry() != listGeometry || project->currentData().toString() != remoteProject)
+        return false;
+    qInfo("Quick add is %d × %d logical pixels at a main window size of %d × %d",
+          composer->width(), composer->height(), width(), height());
+    const auto defaultHeight = composer->height();
+    composerDate->click();
+    if (!cardFields->isVisible() || composer->height() <= defaultHeight) {
+        qWarning("Opening date fields did not fit the dialog: %d -> %d", defaultHeight, composer->height());
+        return false;
+    }
+    composerDate->click();
+    if (!cardFields->isHidden() || composer->height() != defaultHeight) {
+        qWarning("Closing date fields did not restore dialog height: %d -> %d", defaultHeight, composer->height());
+        return false;
+    }
     destination->click();
     auto *picker = composer->findChild<QMenu *>("destinationPicker");
     if (!picker || !picker->isVisible())
@@ -2129,7 +2226,7 @@ bool Window::smokeTest()
     selectData(section, sampleSection);
     title->setText(QStringLiteral("Создано в выбранном проекте"));
     QMetaObject::invokeMethod(title, "returnPressed");
-    if (composer->isVisible() || filter.project != sample || model->rowCount() != 1 ||
+    if (composer->isVisible() || composerShade->isVisible() || filter.project != sample || model->rowCount() != 1 ||
         store.task(model->index(0, 0).data().toString()).section != sampleSection)
         return false;
     board = true;
