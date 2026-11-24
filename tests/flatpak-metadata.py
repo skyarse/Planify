@@ -21,6 +21,7 @@ number = ctypes.c_size_t
 file_new = call("g_file_new_for_path", pointer, ctypes.c_char_p)
 bundle_new = call("flatpak_bundle_ref_new", pointer, pointer, pointer)
 get_appstream = call("flatpak_bundle_ref_get_appstream", pointer, pointer)
+get_metadata = call("flatpak_bundle_ref_get_metadata", pointer, pointer)
 get_icon = call("flatpak_bundle_ref_get_icon", pointer, pointer, ctypes.c_int)
 get_bytes = call("g_bytes_get_data", pointer, pointer, ctypes.POINTER(number))
 
@@ -37,6 +38,8 @@ def verify(path):
     file = file_new(os.fsencode(Path(path).resolve()))
     bundle = bundle_new(file, None)
     assert bundle, "Cannot open Flatpak bundle"
+    permissions = bytes_from(get_metadata(bundle)).split(b"[Session Bus Policy]", 1)[-1].splitlines()
+    assert b"org.freedesktop.secrets=talk" in permissions, "Secret Service fallback is unavailable in Flatpak"
     metadata = bytes_from(get_appstream(bundle))
     assert metadata, "Flatpak bundle is missing AppStream metadata"
     catalog = ET.fromstring(gzip.decompress(metadata))

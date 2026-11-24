@@ -4,6 +4,10 @@
 #include <QUrl>
 
 namespace Credentials {
-QString lookup(const QUrl &address, const QString &user);
+struct Lookup {
+    QString password;
+    bool available;
+};
+Lookup lookup(const QUrl &address, const QString &user);
 bool store(const QUrl &address, const QString &user, const QString &password);
 }

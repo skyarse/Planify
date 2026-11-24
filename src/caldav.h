@@ -23,6 +23,8 @@ signals:
     void imported(const QList<RemoteList> &lists);
     void created(const Task &task);
     void updated(const Task &previous, const Task &task);
+    void credentialsVerified();
+    void credentialsRejected(const QUrl &address, const QString &user);
     void failed(const QString &reason);
     void progress(const QString &message);
 

@@ -555,6 +555,40 @@ void remoteCreation(const QString &path)
 }
 
 
+void caldavCredentials()
+{
+    MockServer server;
+    CalDav client;
+    const QUrl address(QString("http://127.0.0.1:%1/dav.php").arg(server.server.serverPort()));
+    int verified = 0;
+    int rejected = 0;
+    bool finished = false;
+    QEventLoop loop;
+    QTimer alarm;
+    alarm.setSingleShot(true);
+    QObject::connect(&alarm, &QTimer::timeout, &loop, &QEventLoop::quit);
+    QObject::connect(&client, &CalDav::credentialsVerified, &loop, [&] { ++verified; });
+    QObject::connect(&client, &CalDav::credentialsRejected, &loop, [&](const QUrl &url, const QString &user) {
+        expect(url == address && user == "demo", "failure was assigned to the wrong account");
+        ++rejected;
+    });
+    QObject::connect(&client, &CalDav::imported, &loop, [&] { finished = true; loop.quit(); });
+    QObject::connect(&client, &CalDav::failed, &loop, &QEventLoop::quit);
+    const auto wait = [&] { alarm.start(5000); loop.exec(); };
+    expect(client.start(address, "demo", "incorrect"), "failed to start invalid auth fixture");
+    wait();
+    expect(!finished && rejected == 1 && verified == 0 && !client.refreshAccount(),
+           "invalid password remained active or was considered verified");
+    server.reportBroken = true;
+    expect(client.start(address, "demo", "local"), "failed to start authenticated fixture");
+    wait();
+    expect(!finished && verified == 1, "valid credentials were lost after a separate calendar error");
+    server.reportBroken = false;
+    expect(client.refreshAccount(), "the refresh did not reuse the connection");
+    wait();
+    expect(finished && verified == 2 && rejected == 1, "refresh with the accepted password failed");
+}
+
 void projectControls(const QTemporaryDir &root)
 {
     Store store(root.filePath("project-controls.sqlite"));
@@ -631,6 +665,7 @@ int main(int argc, char **argv)
         remoteCreation(root.filePath("remote-creation.sqlite"));
         backupTasks(root);
         projectControls(root);
+        caldavCredentials();
         return 0;
     } catch (const std::exception &error) {
         qCritical("%s", error.what());

@@ -50,6 +50,7 @@ private:
     bool board = false;
     bool selectingTasks = false;
     bool syncing = false;
+    bool authorizing = false;
     struct PasswordChange {
         QUrl address;
         QString user;
@@ -57,7 +58,7 @@ private:
     };
     std::optional<PasswordChange> pendingPassword;
     QThreadPool credentialWorker;
-    QSet<QPair<QUrl, QString>> triedCredentials;
+    QSet<QPair<QUrl, QString>> rejectedCredentials;
     bool systemDark = false;
     QString theme;
     QMap<QDate, QStringList> calendarEvents;

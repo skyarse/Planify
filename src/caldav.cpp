@@ -507,7 +507,11 @@ bool CalDav::refreshAccount()
 
 bool CalDav::start(const QUrl &address, const QString &user, const QString &secret)
 {
-    if (!connectAccount(address, user, secret))
+    if (active)
+        return false;
+    if ((address != origin || user != username || secret != password) && !connectAccount(address, user, secret))
+        return false;
+    if (password.isEmpty())
         return false;
     active = true;
     collection = 0;
@@ -564,6 +568,9 @@ void CalDav::request(Step step, const QUrl &url)
         if (status == 401) {
             password.clear();
             network.clearAccessCache();
+            emit credentialsRejected(origin, username);
+            finish(QStringLiteral("Baïkal отклонил пароль. При следующем обновлении введите новый пароль"));
+            return;
         }
         if (status != 207 || reply->error() != QNetworkReply::NoError) {
             finish(status >= 300 && status < 400
@@ -586,7 +593,10 @@ void CalDav::parse(Step step, const QUrl &url, const QByteArray &data)
         for (const auto &entry : entries) {
             const auto &href = step == Step::Principal ? entry.principal : entry.home;
             if (!href.isEmpty()) {
-                request(step == Step::Principal ? Step::Home : Step::Collections, resolve(url, href));
+                const auto target = resolve(url, href);
+                if (step == Step::Principal)
+                    emit credentialsVerified();
+                request(step == Step::Principal ? Step::Home : Step::Collections, target);
                 return;
             }
         }
@@ -859,7 +869,12 @@ void CalDav::requestWrite(const Project &project, const QUrl &url, const Task &e
         if (status == 401) {
             password.clear();
             network.clearAccessCache();
+            emit credentialsRejected(origin, username);
+            notify(QStringLiteral("Baïkal отклонил пароль. Повторите действие с новым паролем"));
+            return;
         }
+        if (status >= 200 && status < 300 && reply->error() == QNetworkReply::NoError)
+            emit credentialsVerified();
         if (creating && !reading && status == 412) {
             requestWrite(project, url, expected, {}, true);
         } else if (status == 409 || status == 412) {

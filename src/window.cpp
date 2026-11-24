@@ -7,11 +7,13 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QContextMenuEvent>
 #include <QClipboard>
 #include <QDesktopServices>
 #include <QFileDialog>
 #include <QFutureWatcher>
 #include <QProgressDialog>
+#include <QScopedValueRollback>
 #include <QtConcurrentRun>
 #include <QStackedWidget>
 #include <QSaveFile>
@@ -142,6 +144,71 @@ protected:
     }
 };
 
+QRect projectActionsRect(const QRect &row)
+{
+    return {row.right() - 29, row.top(), 30, row.height()};
+}
+
+class ProjectList : public QListWidget {
+public:
+    using QListWidget::QListWidget;
+    std::function<void(const QString &, const QPoint &)> showActions;
+    std::function<void()> syncAccount;
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        const auto point = event->position().toPoint();
+        const auto index = indexAt(point);
+        if (index.isValid() && (event->button() == Qt::RightButton ||
+            (event->button() == Qt::LeftButton && projectActionsRect(visualRect(index)).contains(point)))) {
+            pressed = index;
+            pressedButton = event->button();
+            event->accept();
+            return;
+        }
+        QListWidget::mousePressEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (pressedButton == Qt::NoButton || pressedButton != event->button()) {
+            QListWidget::mouseReleaseEvent(event);
+            return;
+        }
+        const auto point = event->position().toPoint();
+        const auto index = indexAt(point);
+        const bool sameRow = index.isValid() && index == pressed;
+        pressed = QPersistentModelIndex();
+        pressedButton = Qt::NoButton;
+        event->accept();
+        if (!sameRow)
+            return;
+        const bool right = event->button() == Qt::RightButton;
+        if (!right && !projectActionsRect(visualRect(index)).contains(point))
+            return;
+        if (!right && index.data(Qt::UserRole).toString().isEmpty())
+            syncAccount();
+        else {
+            const auto id = index.data(Qt::UserRole).toString();
+            const auto global = event->globalPosition().toPoint();
+            QTimer::singleShot(0, this, [this, id, global] { showActions(id, global); });
+        }
+    }
+
+    void contextMenuEvent(QContextMenuEvent *event) override
+    {
+        event->accept();
+        if (event->reason() == QContextMenuEvent::Keyboard && currentItem())
+            showActions(currentItem()->data(Qt::UserRole).toString(),
+                        viewport()->mapToGlobal(visualItemRect(currentItem()).center()));
+    }
+
+private:
+    QPersistentModelIndex pressed;
+    Qt::MouseButton pressedButton = Qt::NoButton;
+};
+
 class ProjectDelegate : public QStyledItemDelegate {
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
@@ -157,7 +224,8 @@ public:
         const auto rect = opt.rect.adjusted(2,0,-2,-1);
         p->save();
         p->setRenderHint(QPainter::Antialiasing);
-        if (opt.state & (QStyle::State_Selected | QStyle::State_MouseOver)) {
+        const bool showActions = opt.state & (QStyle::State_Selected | QStyle::State_MouseOver);
+        if (showActions) {
             p->setPen(Qt::NoPen);
             p->setBrush(opt.palette.highlight());
             p->drawRoundedRect(rect, 7, 7);
@@ -185,15 +253,17 @@ public:
                 drawMark(*p, Mark::Project, QRectF(rect.left()+1,rect.center().y()-8,16,16), muted, 1.6);
             else
                 p->drawText(rect.adjusted(1,0,-rect.width()+22,0), Qt::AlignVCenter, glyph);
-            p->drawText(rect.adjusted(26,0,-34,0), Qt::AlignVCenter,
-                opt.fontMetrics.elidedText(label,Qt::ElideRight,rect.width()-62));
+            p->drawText(rect.adjusted(26, 0, -59, 0), Qt::AlignVCenter,
+                opt.fontMetrics.elidedText(label, Qt::ElideRight, rect.width() - 85));
+            if (showActions)
+                drawMark(*p, Mark::More, QRectF(rect.right() - 23, rect.center().y() - 9, 18, 18), ink);
             const int count = idx.data(Qt::UserRole+1).toInt();
             if (count > 0) {
                 p->setPen(muted);
                 QFont small = opt.font;
                 small.setPointSizeF(qMax(8.0, opt.font.pointSizeF()-1.5));
                 p->setFont(small);
-                p->drawText(rect.adjusted(0,0,-8,0), Qt::AlignRight | Qt::AlignVCenter, QString::number(count));
+                p->drawText(rect.adjusted(0,0,-32,0), Qt::AlignRight | Qt::AlignVCenter, QString::number(count));
             }
         }
         p->restore();
@@ -448,7 +518,7 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     addAction(preferencesAction);
     menu->addAction(QStringLiteral("О приложении"), this, [this] {
         QMessageBox::about(this, QStringLiteral("План задач"),
-            QStringLiteral("Сборка %1").arg(QStringLiteral(PLAN_TASKS_BUILD)));
+            QStringLiteral("Сборка %1<br>Меню проекта и повторное подключение Baïkal").arg(QStringLiteral(PLAN_TASKS_BUILD)));
     });
     menu->addAction(QStringLiteral("Выйти"), QKeySequence::Quit, this, &Window::close);
     connect(menuButton, &QPushButton::clicked, this, [menuButton, menu] {
@@ -477,7 +547,23 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
     auto *addProject = iconButton(localHeading, Mark::Plus, QStringLiteral("Новый локальный проект"));
     projectHeader->addWidget(addProject);
     left->addWidget(localHeading);
-    projects = new QListWidget(sidebar);
+    auto *projectList = new ProjectList(sidebar);
+    projects = projectList;
+    projectList->showActions = [this](const QString &id, const QPoint &position) {
+        if (!id.isEmpty()) {
+            showProjectMenu(id, position, false);
+        } else {
+            auto *accountMenu = new QMenu(projects);
+            accountMenu->setAttribute(Qt::WA_DeleteOnClose);
+            accountMenu->addAction(QStringLiteral("Обновить Baïkal"), this, &Window::showSync);
+            accountMenu->addAction(QStringLiteral("Настроить подключение…"), this, [this] {
+                if (!syncing && !writing)
+                    authorize({}, true, true);
+            });
+            accountMenu->popup(position);
+        }
+    };
+    projectList->syncAccount = [this] { showSync(); };
     projects->setObjectName("projects");
     projects->setAccessibleName(QStringLiteral("Проекты"));
     projects->setItemDelegate(new ProjectDelegate(projects));
@@ -940,13 +1026,9 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
             showSync();
     });
     connect(addSection, &QPushButton::clicked, this, [this] { addProjectSection(filter.project); });
-    projects->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(projects, &QListWidget::customContextMenuRequested, this, [this](const QPoint &point) {
-        if (const auto *row = projects->itemAt(point)) {
-            const auto id = row->data(Qt::UserRole).toString();
-            if (!id.isEmpty())
-                showProjectMenu(id, projects->viewport()->mapToGlobal(point), false);
-        }
+    connect(&caldav, &CalDav::credentialsVerified, this, &Window::saveConfirmedPassword);
+    connect(&caldav, &CalDav::credentialsRejected, this, [this](const QUrl &address, const QString &user) {
+        rejectedCredentials.insert(qMakePair(address.adjusted(QUrl::StripTrailingSlash), user));
     });
     connect(&caldav, &CalDav::progress, this, [this](const QString &text) { status->setText(text); });
     connect(&caldav, &CalDav::failed, this, [this](const QString &error) {
@@ -959,7 +1041,6 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         message(error);
     });
     connect(&caldav, &CalDav::created, this, [this](const Task &created) {
-        saveConfirmedPassword();
         writing = false;
         writingId.clear();
         syncButton->setEnabled(true);
@@ -972,7 +1053,6 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         }
     });
     connect(&caldav, &CalDav::updated, this, [this](const Task &previous, const Task &updated) {
-        saveConfirmedPassword();
         writing = false;
         writingId.clear();
         syncButton->setEnabled(true);
@@ -988,7 +1068,6 @@ Window::Window(Store &db, QWidget *parent) : QMainWindow(parent), store(db)
         updateCardActions();
     });
     connect(&caldav, &CalDav::imported, this, [this](const QList<RemoteList> &lists) {
-        saveConfirmedPassword();
         syncing = false;
         syncButton->setEnabled(true);
         try {
@@ -2095,7 +2174,7 @@ void Window::closeEvent(QCloseEvent *event)
 
 void Window::showSync()
 {
-    if (syncing || writing)
+    if (syncing || writing || authorizing)
         return;
     if (caldav.refreshAccount()) {
         syncing = true;
@@ -2107,6 +2186,9 @@ void Window::showSync()
 
 bool Window::authorize(const Project &owner, bool refreshLists, bool configure)
 {
+    if (authorizing)
+        return false;
+    const QScopedValueRollback guard(authorizing, true);
     auto *parent = composer->isVisible() ? static_cast<QWidget *>(composer) : static_cast<QWidget *>(this);
     const QSettings settings;
     const auto savedAddress = QUrl(settings.value("dav/address").toString(), QUrl::StrictMode);
@@ -2118,18 +2200,20 @@ bool Window::authorize(const Project &owner, bool refreshLists, bool configure)
         syncButton->setEnabled(!syncing);
         return syncing;
     };
-    const auto savedAccount = qMakePair(savedAddress, savedLogin);
+    const auto savedAccount = qMakePair(savedAddress.adjusted(QUrl::StripTrailingSlash), savedLogin);
+    bool keyringUnavailable = false;
     if (!configure && settings.value("dav/remember", true).toBool() && savedAddress.isValid() &&
-        !savedLogin.isEmpty() && !triedCredentials.contains(savedAccount)) {
-        triedCredentials.insert(savedAccount);
+        !savedLogin.isEmpty() && !rejectedCredentials.contains(savedAccount)) {
         QProgressDialog waiting(QStringLiteral("Читаю пароль из системного хранилища…"),
             QStringLiteral("Отмена"), 0, 0, parent);
         waiting.setWindowModality(Qt::WindowModal);
-        waiting.setMinimumDuration(0);
-        waiting.show();
+        waiting.setMinimumDuration(250);
+        waiting.setAutoClose(false);
+        waiting.setAutoReset(false);
+        waiting.setValue(0);
         QEventLoop loop;
-        QFutureWatcher<QString> lookup;
-        connect(&lookup, &QFutureWatcher<QString>::finished, &loop, &QEventLoop::quit);
+        QFutureWatcher<Credentials::Lookup> lookup;
+        connect(&lookup, &QFutureWatcher<Credentials::Lookup>::finished, &loop, &QEventLoop::quit);
         connect(&waiting, &QProgressDialog::canceled, &loop, &QEventLoop::quit);
         lookup.setFuture(QtConcurrent::run(&credentialWorker, [savedAddress, savedLogin] {
             return Credentials::lookup(savedAddress, savedLogin);
@@ -2138,14 +2222,17 @@ bool Window::authorize(const Project &owner, bool refreshLists, bool configure)
             loop.exec();
         if (waiting.wasCanceled())
             return false;
-        const auto secret = lookup.result();
-        if (!secret.isEmpty() && start(savedAddress, savedLogin, secret))
+        const auto credential = lookup.result();
+        keyringUnavailable = !credential.available;
+        if (!credential.password.isEmpty() && start(savedAddress, savedLogin, credential.password))
             return true;
     }
     QDialog dialog(parent);
     dialog.setWindowTitle(refreshLists ? QStringLiteral("Baïkal") : QStringLiteral("Подключение к Baïkal"));
     auto *layout = new QFormLayout(&dialog);
-    auto *help = new QLabel(QStringLiteral("Пароль можно сохранить в системном хранилище."), &dialog);
+    auto *help = new QLabel(keyringUnavailable
+        ? QStringLiteral("Системное хранилище было недоступно. Разблокируйте его, чтобы сохранить пароль для следующих запусков.")
+        : QStringLiteral("Пароль можно сохранить в системном хранилище."), &dialog);
     help->setWordWrap(true);
     layout->addRow(help);
     auto *address = new QLineEdit(savedAddress.toDisplayString(), &dialog);
@@ -2177,7 +2264,7 @@ bool Window::authorize(const Project &owner, bool refreshLists, bool configure)
             message(QStringLiteral("Адрес и логин должны соответствовать списку Baïkal"));
         return false;
     }
-    triedCredentials.insert(qMakePair(url, user));
+    rejectedCredentials.remove(qMakePair(url.adjusted(QUrl::StripTrailingSlash), user));
     pendingPassword = PasswordChange{url, user, remember->isChecked() ? password : QString()};
     QSettings saved;
     saved.setValue("dav/address", url.toString(QUrl::FullyEncoded));
@@ -2303,15 +2390,42 @@ bool Window::smokeTest()
     if (composer->isVisible() || composerShade->isVisible() || filter.project != sample || model->rowCount() != 1 ||
         store.task(model->index(0, 0).data().toString()).section != sampleSection)
         return false;
-    const auto point = projects->visualItemRect(projects->currentItem()).center();
-    QMetaObject::invokeMethod(projects, "customContextMenuRequested", Q_ARG(QPoint, point));
-    auto *projectMenu = findChild<QMenu *>("projectActions");
-    if (!projectMenu || !projectMenu->isVisible() || projectMenu->actions().size() < 6)
+    QApplication::processEvents();
+    QApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QListWidgetItem *remoteItem = nullptr;
+    for (int row = 0; row < projects->count(); ++row)
+        if (projects->item(row)->data(Qt::UserRole).toString() == remoteProject)
+            remoteItem = projects->item(row);
+    if (!remoteItem)
         return false;
+    const auto mouseClick = [this](Qt::MouseButton button, const QPoint &point) {
+        auto *viewport = projects->viewport();
+        const auto global = viewport->mapToGlobal(point);
+        QMouseEvent press(QEvent::MouseButtonPress, point, global, button, button, Qt::NoModifier);
+        QMouseEvent release(QEvent::MouseButtonRelease, point, global, button, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport, &press);
+        QApplication::sendEvent(viewport, &release);
+        QApplication::processEvents();
+    };
+    mouseClick(Qt::RightButton, projects->visualItemRect(remoteItem).center());
+    auto *projectMenu = findChild<QMenu *>("projectActions");
+    if (!projectMenu || !projectMenu->isVisible() || filter.project != sample || projectMenu->actions().size() < 6) {
+        qWarning() << "Right click did not leave the remote project menu visible" << projectMenu
+                   << (projectMenu && projectMenu->isVisible());
+        return false;
+    }
     projectMenu->actions().first()->trigger();
     projectMenu->close();
-    if (!store.project(sample).favorite)
+    QApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    if (!store.project(remoteProject).favorite || store.project(sample).favorite)
         return false;
+    mouseClick(Qt::LeftButton, projectActionsRect(projects->visualItemRect(projects->currentItem())).center());
+    auto *rowMenu = findChild<QMenu *>("projectActions");
+    if (!rowMenu || !rowMenu->isVisible()) {
+        qWarning("Click on project ellipsis did not open actions");
+        return false;
+    }
+    rowMenu->close();
     auto *viewOptions = findChild<QPushButton *>("projectViewOptions");
     if (!viewOptions)
         return false;
