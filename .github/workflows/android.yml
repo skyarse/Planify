@@ -31,9 +31,24 @@ jobs:
         env:
           ANDROID_DEBUG_KEYSTORE: ${{ runner.temp }}/plan-tasks-dev.keystore
         run: |
-          sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+          if ! command -v javac >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends openjdk-21-jdk-headless
+          fi
+          sdk="$RUNNER_TEMP/plan-android-sdk"
+          mkdir -p "$sdk/platforms" "$sdk/build-tools"
+          curl -fsSL --retry 2 https://dl.google.com/android/repository/platform-36_r02.zip -o "$sdk/platform.zip"
+          curl -fsSL --retry 2 https://dl.google.com/android/repository/build-tools_r36_linux.zip -o "$sdk/tools.zip"
+          (cd "$sdk" && sha256sum -c <<'SHA256'
+          37607369a28c5b640b3a7998868d45898ebcb777565a0e85f9acf36f29631d2e  platform.zip
+          5d9ac77fb6ff43d9da518a337b4fcf8f9097113df531d99ccefe80ef7ce8250b  tools.zip
+          SHA256
+          )
+          unzip -q "$sdk/platform.zip" -d "$sdk/platforms"
+          unzip -q "$sdk/tools.zip" -d "$sdk/unpack"
+          mv "$sdk/unpack/android-16" "$sdk/build-tools/36.0.0"
           android/test.sh
-          android/build.sh
+          ANDROID_HOME="$sdk" android/build.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: plan-tasks-android-ci
