@@ -68,6 +68,7 @@ int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
     QApplication::setApplicationName("plan-tasks");
+    QApplication::setDesktopFileName("local.plan.tasks");
     QApplication::setApplicationDisplayName(QStringLiteral("План задач"));
     QApplication::setOrganizationName("plan-tasks");
     QCommandLineParser parser;

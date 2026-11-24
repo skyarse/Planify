@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>local.plan.tasks</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>Plan Tasks</name>
+  <name xml:lang="ru">План задач</name>
+  <summary>Organize tasks and projects offline</summary>
+  <summary xml:lang="ru">Управляйте задачами и проектами офлайн</summary>
+  <description>
+    <p>Organize tasks and subtasks into projects, set due dates and priorities, and keep track of recurring work. Browse a local copy of task lists imported from Baïkal.</p>
+    <p xml:lang="ru">Распределяйте задачи и подзадачи по проектам, назначайте сроки и приоритеты, настраивайте повторы. Просматривайте локальную копию списков задач, импортированных из Baïkal.</p>
+  </description>
+  <developer id="com.github.skyarse">
+    <name>Plan Tasks contributors</name>
+    <name xml:lang="ru">Команда «План задач»</name>
+  </developer>
+  <launchable type="desktop-id">local.plan.tasks.desktop</launchable>
+  <categories>
+    <category>Office</category>
+    <category>ProjectManagement</category>
+  </categories>
+  <url type="homepage">https://github.com/skyarse/Planify</url>
+  <url type="bugtracker">https://github.com/skyarse/Planify/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-23"/>
+  </releases>
+</component>

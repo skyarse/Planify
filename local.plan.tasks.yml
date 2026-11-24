@@ -3,6 +3,7 @@ runtime: org.kde.Platform
 runtime-version: '6.11'
 sdk: org.kde.Sdk
 command: plan-tasks
+appstream-compose: false
 finish-args:
   - --share=network
   - --share=ipc
@@ -15,6 +16,11 @@ modules:
       - -DCMAKE_BUILD_TYPE=Release
     run-tests: true
     test-rule: test
+    post-install:
+      - >-
+        appstreamcli compose --no-net --prefix=/app --origin=local.plan.tasks
+        --result-root=/app --data-dir=/app/share/app-info/xmls
+        --icons-dir=/app/share/app-info/icons/flatpak --components=local.plan.tasks /
     sources:
       - type: dir
         path: .

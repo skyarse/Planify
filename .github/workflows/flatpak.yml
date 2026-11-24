@@ -25,7 +25,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder dbus elfutils
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder dbus elfutils libglib2.0-bin
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           channel=dev
           if [[ "$GITHUB_REF" == refs/heads/main ]]; then
@@ -39,9 +39,24 @@ jobs:
           bundle="$RUNNER_TEMP/plan-bundle/plan-tasks-x86_64.flatpak"
           flatpak build-bundle --arch=x86_64 --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
             "$build_root/repo" "$bundle" local.plan.tasks "$channel"
+          python3 tests/flatpak-metadata.py "$bundle"
           dbus-run-session -- flatpak install --user --no-related --no-deps -y "$bundle"
           dbus-run-session -- flatpak run --user --env=QT_QPA_PLATFORM=offscreen \
             "local.plan.tasks//$channel" --smoke-test
+          dbus-run-session -- bash -euo pipefail -c '
+            app=local.plan.tasks
+            launcher="$HOME/.local/share/flatpak/exports/share/applications/$app.desktop"
+            test -f "$launcher"
+            grep -Fx "Name[ru]=План задач" "$launcher"
+            flatpak override --user --env=QT_QPA_PLATFORM=offscreen "$app"
+            trap "flatpak kill $app || true" EXIT
+            gio launch "$launcher"
+            for attempt in {1..20}; do
+              if flatpak ps --columns=application | grep -Fxq "$app"; then exit 0; fi
+              sleep 1
+            done
+            exit 1
+          '
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: flatpak-x86_64

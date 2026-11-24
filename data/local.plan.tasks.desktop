@@ -1,6 +1,8 @@
 [Desktop Entry]
-Name=План задач
-Name[en]=Task Plan
+Name=Plan Tasks
+Name[ru]=План задач
+Comment=Organize tasks and projects offline
+Comment[ru]=Управляйте задачами и проектами офлайн
 Exec=plan-tasks
 Icon=local.plan.tasks
 Terminal=false

@@ -18,6 +18,7 @@ target_link_libraries(plan-tasks PRIVATE plan-core Qt6::Widgets)
 
 install(TARGETS plan-tasks RUNTIME DESTINATION bin)
 install(FILES data/local.plan.tasks.desktop DESTINATION share/applications)
+install(FILES data/local.plan.tasks.metainfo.xml DESTINATION share/metainfo)
 install(FILES data/local.plan.tasks.svg DESTINATION share/icons/hicolor/scalable/apps)
 
 include(CTest)
